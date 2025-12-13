@@ -36,8 +36,16 @@ class EntityExtractor(dspy.Module):
         self.validate = dspy.ChainOfThought(ValidateExtraction)
         self.grounder = SourceGrounder()
 
-    def forward(self, text: str, chunk_offset: int = 0) -> ExtractionResult:
-        """Extract structured entities from text with validation."""
+    def forward(
+        self, text: str, chunk_offset: int = 0, run_validation: bool = True
+    ) -> ExtractionResult:
+        """Extract structured entities from text.
+
+        Args:
+            text: Input text to extract from
+            chunk_offset: Offset to add to source spans (when processing chunks)
+            run_validation: If False, skip the LLM validation step (`self.validate`)
+        """
         schema_json = json.dumps(get_json_schema(self.schema), indent=2)
 
         # Perform extraction
@@ -59,10 +67,17 @@ class EntityExtractor(dspy.Module):
             entities_dict = {}
             sources_dict = {}
 
-        # Validate extraction using DSPy
-        validation = self.validate(
-            text=text, entities=entities_json, schema_spec=schema_json
-        )
+        # Validate extraction using DSPy (optional)
+        if run_validation:
+            validation = self.validate(
+                text=text, entities=entities_json, schema_spec=schema_json
+            )
+            is_valid = bool(getattr(validation, "is_valid", True))
+            validation_feedback = getattr(validation, "feedback", "")
+        else:
+            validation = None
+            is_valid = True
+            validation_feedback = "Validation skipped"
 
         # Ground entities to source locations
         if not sources_dict:  # If LLM didn't provide sources, compute them
@@ -80,15 +95,16 @@ class EntityExtractor(dspy.Module):
             )
 
         # Calculate overall confidence
-        confidence = self._calculate_confidence(validation.is_valid, entities_dict)
+        confidence = self._calculate_confidence(is_valid, entities_dict)
 
         return ExtractionResult(
             entities=entities_dict,
             sources=grounded_sources,
             confidence=confidence,
             metadata={
-                "validation_feedback": validation.feedback,
-                "is_valid": validation.is_valid,
+                "validation_feedback": validation_feedback,
+                "is_valid": is_valid,
+                "validation_skipped": not run_validation,
                 "chunk_offset": chunk_offset,
             },
         )
@@ -414,15 +430,23 @@ class ExtractionPipeline(dspy.Module):
         self.extractor = EntityExtractor(schema, use_sources)
         self.aggregator = ResultAggregator(schema)
 
-    def forward(self, text: str) -> ExtractionResult:
-        """Run the complete extraction pipeline on input text."""
+    def forward(self, text: str, run_validation: bool = True) -> ExtractionResult:
+        """Run the complete extraction pipeline on input text.
+
+        Args:
+            text: Input text to extract from
+            run_validation: If False, skip the LLM validation step inside
+                `EntityExtractor` (i.e., it will not call `self.validate`).
+        """
         # Step 1: Chunk the text
         chunks = self.chunker(text)
 
         # Step 2: Extract from each chunk
         chunk_results = []
         for chunk in chunks:
-            extraction = self.extractor(chunk.text, chunk.start_offset)
+            extraction = self.extractor(
+                chunk.text, chunk.start_offset, run_validation=run_validation
+            )
             chunk_result = ChunkResult(
                 chunk_id=chunk.id,
                 chunk_text=chunk.text,
