@@ -89,14 +89,19 @@ class EntityExtractor(dspy.Module):
             else self.reasoning
         )
         logger.info(
-            "EntityExtractor.forward reasoning=%s run_validation=%s",
-            effective_reasoning.value,
-            bool(run_validation),
+            "EntityExtractor.forward config=%s",
+            {
+                "reasoning": effective_reasoning.value,
+                "run_validation": bool(run_validation),
+                "use_sources": self.use_sources,
+                "schema": getattr(self.schema, "__name__", str(self.schema)),
+                "chunk_offset": chunk_offset,
+            },
         )
 
         schema_json = json.dumps(get_json_schema(self.schema), indent=2)
 
-        # Perform extraction
+        # Perform extraction using the appropriate extractor based on reasoning mode
         extractor = (
             self._extract_cot
             if effective_reasoning == ReasoningMode.COT
@@ -133,7 +138,6 @@ class EntityExtractor(dspy.Module):
             is_valid = bool(getattr(validation, "is_valid", True))
             validation_feedback = getattr(validation, "feedback", "")
         else:
-            validation = None
             is_valid = True
             validation_feedback = "Validation skipped"
 
@@ -168,7 +172,7 @@ class EntityExtractor(dspy.Module):
         )
 
     def _parse_llm_sources(
-        self, sources_dict: Dict, chunk_offset: int, text: str = None
+        self, sources_dict: Dict[str, Any], chunk_offset: int, text: Optional[str] = None
     ) -> Dict[str, List[SourceSpan]]:
         """Parse source information provided by LLM into SourceSpan objects.
 
@@ -217,7 +221,7 @@ class EntityExtractor(dspy.Module):
         self,
         sources: Dict[str, List[SourceSpan]],
         text: str,
-        entities_dict: Dict,
+        entities_dict: Dict[str, Any],
         chunk_offset: int,
     ) -> Dict[str, List[SourceSpan]]:
         """Validate LLM-provided sources and fix incorrect ones.
@@ -306,7 +310,7 @@ class EntityExtractor(dspy.Module):
 
         return fixed_sources
 
-    def _calculate_confidence(self, is_valid: bool, entities_dict: Dict) -> float:
+    def _calculate_confidence(self, is_valid: bool, entities_dict: Dict[str, Any]) -> float:
         """Calculate overall extraction confidence score."""
         base_confidence = 0.8 if is_valid else 0.4
 
@@ -611,7 +615,7 @@ class QueryParser(dspy.Module):
         )
 
     def _calculate_confidence(
-        self, semantic_terms: List[str], structured_filters: Dict
+        self, semantic_terms: List[str], structured_filters: Dict[str, Any]
     ) -> float:
         """Calculate confidence score for the parsing.
 
@@ -636,7 +640,7 @@ class QueryParser(dspy.Module):
         return min(confidence, 1.0)
 
     def _generate_explanation(
-        self, query: str, semantic_terms: List[str], structured_filters: Dict
+        self, query: str, semantic_terms: List[str], structured_filters: Dict[str, Any]
     ) -> str:
         """Generate human-readable explanation of the parsing.
 

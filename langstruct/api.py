@@ -1,6 +1,7 @@
 """Main LangStruct API for LLM-powered structured information extraction."""
 
 import inspect
+import logging
 import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type, Union, overload
@@ -29,6 +30,8 @@ from .optimizers.mipro import MIPROv2Optimizer
 from .parallel import ParallelProcessor, ProcessingResult
 from .providers.llm_factory import LLMFactory
 from .visualization.html_viz import save_visualization, visualize
+
+logger = logging.getLogger(__name__)
 
 
 class LangStruct:
@@ -503,6 +506,52 @@ class LangStruct:
         """Extract from a single text (internal helper method)."""
         if not text.strip():
             return ExtractionResult(entities={}, sources={})
+
+        # Log the effective configuration once per run (not per chunk).
+        # Avoid logging raw text (can be huge / sensitive).
+        pipeline_chunking = None
+        try:
+            # ExtractionPipeline -> TextChunkerModule -> TextChunker -> ChunkingConfig
+            pipeline_chunking = (
+                getattr(getattr(getattr(self.pipeline, "chunker", None), "chunker", None), "config", None)
+            )
+        except Exception:
+            pipeline_chunking = None
+
+        logger.info(
+            "LangStruct.extract config=%s",
+            {
+                "schema": getattr(self.schema, "__name__", str(self.schema)),
+                "text_length": len(text),
+                "confidence_threshold": confidence_threshold,
+                # Post-extraction validator (ExtractionResult.validate_quality)
+                "validate": bool(validate),
+                "debug": bool(debug),
+                # LLM validation step inside EntityExtractor
+                "run_validation": bool(run_validation),
+                "reasoning": str(reasoning),
+                # Sources/chunking/refine knobs
+                "return_sources_override": return_sources,
+                "use_sources_default": getattr(self, "use_sources", None),
+                "chunking_config_init": (
+                    self.chunking_config.model_dump()
+                    if getattr(self, "chunking_config", None) is not None
+                    else None
+                ),
+                "chunking_config_effective": (
+                    pipeline_chunking.model_dump()
+                    if pipeline_chunking is not None and hasattr(pipeline_chunking, "model_dump")
+                    else None
+                ),
+                "refine_requested": refine,
+                "refine_default": (
+                    self.refine_config.model_dump()
+                    if getattr(self, "refine_config", None) is not None
+                    and hasattr(self.refine_config, "model_dump")
+                    else (self.refine_config if getattr(self, "refine_config", None) is not None else None)
+                ),
+            },
+        )
 
         # Optionally override source grounding for this call only
         overridden = False
