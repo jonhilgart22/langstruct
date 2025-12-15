@@ -485,22 +485,40 @@ class ExtractionPipeline(dspy.Module):
         schema: Type[BaseModel],
         chunking_config: Optional[ChunkingConfig] = None,
         use_sources: bool = True,
+        reasoning: Union[ReasoningMode, str] = ReasoningMode.PREDICT,
     ):
         super().__init__()
         self.schema = schema
         self.chunker = TextChunkerModule(chunking_config)
-        self.extractor = EntityExtractor(schema, use_sources)
+        self.extractor = EntityExtractor(schema, use_sources, reasoning=reasoning)
         self.aggregator = ResultAggregator(schema)
 
-    def forward(self, text: str) -> ExtractionResult:
-        """Run the complete extraction pipeline on input text."""
+    def forward(
+        self,
+        text: str,
+        run_validation: bool = True,
+        reasoning: Union[ReasoningMode, str, None] = None,
+    ) -> ExtractionResult:
+        """Run the complete extraction pipeline on input text.
+
+        Args:
+            text: Input text to extract from
+            run_validation: If False, skip the LLM validation step inside
+                `EntityExtractor` (i.e., it will not call `self.validate`).
+            reasoning: Override reasoning strategy for this call ("predict" or "cot")
+        """
         # Step 1: Chunk the text
         chunks = self.chunker(text)
 
         # Step 2: Extract from each chunk
         chunk_results = []
         for chunk in chunks:
-            extraction = self.extractor(chunk.text, chunk.start_offset)
+            extraction = self.extractor(
+                chunk.text,
+                chunk.start_offset,
+                run_validation=run_validation,
+                reasoning=reasoning,
+            )
             chunk_result = ChunkResult(
                 chunk_id=chunk.id,
                 chunk_text=chunk.text,
