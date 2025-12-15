@@ -55,6 +55,7 @@ class ValidateExtraction(dspy.Signature):
 
     Verify that extracted entities are accurate, complete, and properly
     grounded in the source text.
+
     """
 
     text: Annotated[str, dspy.InputField(desc="Original source text")]

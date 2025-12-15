@@ -1,7 +1,8 @@
 """DSPy refinement system for improving extraction quality through Best-of-N, refinement, and committee scoring."""
 
+import concurrent.futures
 import json
-import random
+import logging
 import warnings
 from dataclasses import dataclass
 from enum import Enum
@@ -9,6 +10,8 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import dspy
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 from .schema_utils import get_field_descriptions, get_json_schema
 from .schemas import ExtractionResult, SourceSpan
@@ -386,6 +389,22 @@ class RefinementEngine(dspy.Module):
         Returns:
             Tuple of (best_result, trace_info)
         """
+        logger.info(
+            "RefinementEngine.forward starting config=%s",
+            {
+                "strategy": refine_config.strategy.value,
+                "n_candidates": refine_config.n_candidates,
+                "max_refine_steps": refine_config.max_refine_steps,
+                "temperature": refine_config.temperature,
+                "has_custom_judge": refine_config.judge is not None,
+                "budget": {
+                    "max_calls": refine_config.budget.max_calls if refine_config.budget else None,
+                    "max_tokens": refine_config.budget.max_tokens if refine_config.budget else None,
+                } if refine_config.budget else None,
+                "schema": getattr(self.schema, "__name__", str(self.schema)),
+                "text_length": len(text),
+            },
+        )
         trace = RefinementTrace()
         calls_used = 0
         tokens_used = 0  # TODO: Implement token counting
@@ -405,10 +424,20 @@ class RefinementEngine(dspy.Module):
             RefinementStrategy.BON,
             RefinementStrategy.BON_THEN_REFINE,
         ]:
+            logger.info(
+                "RefinementEngine generating candidates n_candidates=%d temperature=%.2f",
+                refine_config.n_candidates,
+                refine_config.temperature,
+            )
             candidates = self._generate_candidates(
                 text, refine_config.n_candidates, refine_config.temperature
             )
             calls_used += len(candidates)
+            logger.info(
+                "RefinementEngine candidates generated count=%d calls_used=%d",
+                len(candidates),
+                calls_used,
+            )
 
             # Check budget after candidate generation
             if refine_config.budget and refine_config.budget.check_exceeded(
@@ -427,9 +456,19 @@ class RefinementEngine(dspy.Module):
 
         # Step 2: Judge candidates and select best
         if len(candidates) > 1:
+            logger.info(
+                "RefinementEngine judging candidates count=%d custom_judge=%s",
+                len(candidates),
+                refine_config.judge is not None,
+            )
             judge = self._get_judge(refine_config.judge)
             scores = judge(text, candidates)
             calls_used += 1  # Judge call
+            logger.info(
+                "RefinementEngine judging complete scores=%s calls_used=%d",
+                [round(s[0], 3) for s in scores],
+                calls_used,
+            )
 
             # Create candidate results with scores
             for i, (candidate, (score, reasoning)) in enumerate(
@@ -465,6 +504,10 @@ class RefinementEngine(dspy.Module):
             RefinementStrategy.REFINE,
             RefinementStrategy.BON_THEN_REFINE,
         ]:
+            logger.info(
+                "RefinementEngine starting refinement steps max_steps=%d",
+                refine_config.max_refine_steps,
+            )
             current_result = best_candidate
 
             for step in range(refine_config.max_refine_steps):
@@ -472,9 +515,19 @@ class RefinementEngine(dspy.Module):
                 if refine_config.budget and refine_config.budget.check_exceeded(
                     calls_used, tokens_used
                 ):
+                    logger.info(
+                        "RefinementEngine budget exceeded at step=%d calls_used=%d",
+                        step,
+                        calls_used,
+                    )
                     warnings.warn(f"Budget exceeded at refinement step {step}")
                     break
 
+                logger.info(
+                    "RefinementEngine refine step=%d/%d starting",
+                    step + 1,
+                    refine_config.max_refine_steps,
+                )
                 prev_entities = current_result.entities.copy()
                 refined_result = self.refiner(text, current_result)
                 calls_used += 1
@@ -489,44 +542,76 @@ class RefinementEngine(dspy.Module):
                         - current_result.confidence,
                     }
                 )
+                logger.info(
+                    "RefinementEngine refine step=%d/%d complete changes=%d confidence_delta=%.3f calls_used=%d",
+                    step + 1,
+                    refine_config.max_refine_steps,
+                    len(diff),
+                    refined_result.confidence - current_result.confidence,
+                    calls_used,
+                )
 
                 current_result = refined_result
 
                 # Early stopping if no changes
                 if not diff:
+                    logger.info(
+                        "RefinementEngine early stopping at step=%d (no changes)",
+                        step + 1,
+                    )
                     break
 
             best_candidate = current_result
 
         trace.budget_used = {"calls": calls_used, "tokens": tokens_used}
+        logger.info(
+            "RefinementEngine.forward complete budget_used=%s chosen_candidate=%s final_confidence=%.3f",
+            trace.budget_used,
+            trace.chosen_candidate,
+            best_candidate.confidence,
+        )
         return best_candidate, trace
 
     def _generate_candidates(
         self, text: str, n_candidates: int, temperature: float
     ) -> List[ExtractionResult]:
-        """Generate multiple extraction candidates with diversity."""
-        candidates = []
+        """Generate multiple extraction candidates with diversity.
 
-        # Store original LM settings
-        original_lm = dspy.settings.lm
+        Candidates are generated in parallel using ThreadPoolExecutor for
+        improved performance when using API-based LLMs.
+        """
+        if n_candidates == 1:
+            # No need for parallel execution with single candidate
+            return [self.extractor(text)]
 
-        try:
-            # Create varied settings for diversity
-            for i in range(n_candidates):
-                # Use different seeds and slight temperature variation for diversity
-                seed = random.randint(0, 10000) if i > 0 else None
+        def extract_candidate(candidate_idx: int) -> Tuple[int, ExtractionResult]:
+            """Extract a single candidate, returning index for ordering."""
+            logger.info(
+                "RefinementEngine generating candidate %d/%d",
+                candidate_idx + 1,
+                n_candidates,
+            )
+            result = self.extractor(text)
+            logger.info(
+                "RefinementEngine candidate %d/%d complete confidence=%.3f",
+                candidate_idx + 1,
+                n_candidates,
+                result.confidence,
+            )
+            return (candidate_idx, result)
 
-                # TODO: Implement proper temperature/seed control for LM
-                # For now, just call the extractor multiple times
-                candidate = self.extractor(text)
-                candidates.append(candidate)
+        # Generate candidates in parallel
+        candidates: List[Optional[ExtractionResult]] = [None] * n_candidates
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_candidates) as executor:
+            futures = [
+                executor.submit(extract_candidate, i) for i in range(n_candidates)
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                idx, result = future.result()
+                candidates[idx] = result
 
-        finally:
-            # Restore original settings
-            if original_lm:
-                dspy.configure(lm=original_lm)
-
-        return candidates
+        # Filter out any None values (shouldn't happen, but defensive)
+        return [c for c in candidates if c is not None]
 
     def _get_judge(self, custom_rubric: Optional[str]):
         """Get appropriate judge based on configuration."""
