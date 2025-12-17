@@ -140,6 +140,9 @@ class CandidateResult(BaseModel):
     extraction: ExtractionResult
     score: float = Field(ge=0.0, le=1.0, description="Judge score")
     reasoning: Optional[str] = Field(default=None, description="Judge reasoning")
+    feedback: str = Field(
+        description="Actionable feedback for improving the extraction"
+    )
     candidate_id: int = Field(description="Candidate identifier")
 
 
@@ -162,10 +165,10 @@ class BuiltinJudge(dspy.Module):
 
     def forward(
         self, text: str, candidates: List[ExtractionResult]
-    ) -> List[Tuple[float, str]]:
+    ) -> List[Tuple[float, str, str]]:
         """Score candidates using built-in rubric.
 
-        Returns list of (score, reasoning) tuples.
+        Returns list of (score, reasoning, feedback) tuples.
         """
         if not candidates:
             return []
@@ -199,7 +202,8 @@ class BuiltinJudge(dspy.Module):
             "2. Completeness: All required fields should be filled when data is available\n"
             "3. Source quality: Source spans should contain the complete extracted values\n"
             "4. No hallucination: Never extract values not present in the original text\n"
-            "Prefer candidates that exactly quote from the text over those that paraphrase."
+            "Prefer candidates that exactly quote from the text over those that paraphrase.\n\n"
+            "For each candidate, provide specific actionable feedback on how to improve the extraction."
         )
 
         result = self.judge(
@@ -213,15 +217,23 @@ class BuiltinJudge(dspy.Module):
             scores_data = json.loads(result.scores)
             if isinstance(scores_data, list):
                 return [
-                    (item.get("score", 0.5), item.get("reasoning", ""))
+                    (
+                        item.get("score", 0.5),
+                        item.get("reasoning", ""),
+                        item.get("feedback", "No specific feedback provided"),
+                    )
                     for item in scores_data
                 ]
             else:
                 # Fallback if format is unexpected
-                return [(0.5, "Judge output format unexpected")] * len(candidates)
+                return [
+                    (0.5, "Judge output format unexpected", "No feedback available")
+                ] * len(candidates)
         except (json.JSONDecodeError, AttributeError):
             warnings.warn("Judge output could not be parsed, using fallback scores")
-            return [(0.5, "Judge parsing failed")] * len(candidates)
+            return [(0.5, "Judge parsing failed", "No feedback available")] * len(
+                candidates
+            )
 
 
 class CustomJudge(dspy.Module):
@@ -235,8 +247,11 @@ class CustomJudge(dspy.Module):
 
     def forward(
         self, text: str, candidates: List[ExtractionResult]
-    ) -> List[Tuple[float, str]]:
-        """Score candidates using custom rubric."""
+    ) -> List[Tuple[float, str, str]]:
+        """Score candidates using custom rubric.
+
+        Returns list of (score, reasoning, feedback) tuples.
+        """
         if not candidates:
             return []
 
@@ -261,27 +276,41 @@ class CustomJudge(dspy.Module):
 
         schema_json = json.dumps(get_json_schema(self.schema), indent=2)
 
+        # Append feedback instruction to custom rubric
+        rubric_with_feedback = (
+            f"{self.rubric}\n\n"
+            "For each candidate, provide specific actionable feedback on how to improve the extraction."
+        )
+
         result = self.judge(
             text=text,
             candidates=candidates_json,
             schema_spec=schema_json,
-            rubric=self.rubric,
+            rubric=rubric_with_feedback,
         )
 
         try:
             scores_data = json.loads(result.scores)
             if isinstance(scores_data, list):
                 return [
-                    (item.get("score", 0.5), item.get("reasoning", ""))
+                    (
+                        item.get("score", 0.5),
+                        item.get("reasoning", ""),
+                        item.get("feedback", "No specific feedback provided"),
+                    )
                     for item in scores_data
                 ]
             else:
-                return [(0.5, "Judge output format unexpected")] * len(candidates)
+                return [
+                    (0.5, "Judge output format unexpected", "No feedback available")
+                ] * len(candidates)
         except (json.JSONDecodeError, AttributeError):
             warnings.warn(
                 "Custom judge output could not be parsed, using fallback scores"
             )
-            return [(0.5, "Judge parsing failed")] * len(candidates)
+            return [(0.5, "Judge parsing failed", "No feedback available")] * len(
+                candidates
+            )
 
 
 class ExtractionRefiner(dspy.Module):
@@ -397,10 +426,22 @@ class RefinementEngine(dspy.Module):
                 "max_refine_steps": refine_config.max_refine_steps,
                 "temperature": refine_config.temperature,
                 "has_custom_judge": refine_config.judge is not None,
-                "budget": {
-                    "max_calls": refine_config.budget.max_calls if refine_config.budget else None,
-                    "max_tokens": refine_config.budget.max_tokens if refine_config.budget else None,
-                } if refine_config.budget else None,
+                "budget": (
+                    {
+                        "max_calls": (
+                            refine_config.budget.max_calls
+                            if refine_config.budget
+                            else None
+                        ),
+                        "max_tokens": (
+                            refine_config.budget.max_tokens
+                            if refine_config.budget
+                            else None
+                        ),
+                    }
+                    if refine_config.budget
+                    else None
+                ),
                 "schema": getattr(self.schema, "__name__", str(self.schema)),
                 "text_length": len(text),
             },
@@ -471,7 +512,7 @@ class RefinementEngine(dspy.Module):
             )
 
             # Create candidate results with scores
-            for i, (candidate, (score, reasoning)) in enumerate(
+            for i, (candidate, (score, reasoning, feedback)) in enumerate(
                 zip(candidates, scores)
             ):
                 trace.candidates.append(
@@ -479,6 +520,7 @@ class RefinementEngine(dspy.Module):
                         extraction=candidate,
                         score=score,
                         reasoning=reasoning,
+                        feedback=feedback,
                         candidate_id=i,
                     )
                 )
@@ -486,14 +528,17 @@ class RefinementEngine(dspy.Module):
             # Select best candidate
             best_idx = max(range(len(scores)), key=lambda i: scores[i][0])
             best_candidate = candidates[best_idx]
+            best_feedback = scores[best_idx][2]  # Get feedback for the best candidate
             trace.chosen_candidate = best_idx
         else:
             best_candidate = candidates[0]
+            best_feedback = "General quality improvement needed"
             trace.candidates.append(
                 CandidateResult(
                     extraction=best_candidate,
                     score=best_candidate.confidence,
                     reasoning="Single candidate",
+                    feedback=best_feedback,
                     candidate_id=0,
                 )
             )
@@ -505,10 +550,12 @@ class RefinementEngine(dspy.Module):
             RefinementStrategy.BON_THEN_REFINE,
         ]:
             logger.info(
-                "RefinementEngine starting refinement steps max_steps=%d",
+                "RefinementEngine starting refinement steps max_steps=%d feedback=%s",
                 refine_config.max_refine_steps,
+                best_feedback[:100] if best_feedback else None,
             )
             current_result = best_candidate
+            current_feedback = best_feedback
 
             for step in range(refine_config.max_refine_steps):
                 # Check budget before refinement step
@@ -524,12 +571,16 @@ class RefinementEngine(dspy.Module):
                     break
 
                 logger.info(
-                    "RefinementEngine refine step=%d/%d starting",
+                    "RefinementEngine refine step=%d/%d starting with feedback=%s",
                     step + 1,
                     refine_config.max_refine_steps,
+                    current_feedback[:100] if current_feedback else None,
                 )
                 prev_entities = current_result.entities.copy()
-                refined_result = self.refiner(text, current_result)
+                # Pass judge feedback as issues to refiner
+                refined_result = self.refiner(
+                    text, current_result, issues=current_feedback
+                )
                 calls_used += 1
 
                 # Track changes
@@ -540,8 +591,11 @@ class RefinementEngine(dspy.Module):
                         "changes": diff,
                         "confidence_change": refined_result.confidence
                         - current_result.confidence,
+                        "feedback_used": current_feedback,
                     }
                 )
+                # Update feedback for next iteration (use detected issues from refiner)
+                current_feedback = self.refiner._detect_issues(text, refined_result)
                 logger.info(
                     "RefinementEngine refine step=%d/%d complete changes=%d confidence_delta=%.3f calls_used=%d",
                     step + 1,
@@ -602,7 +656,9 @@ class RefinementEngine(dspy.Module):
 
         # Generate candidates in parallel
         candidates: List[Optional[ExtractionResult]] = [None] * n_candidates
-        with concurrent.futures.ThreadPoolExecutor(max_workers=n_candidates) as executor:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=n_candidates
+        ) as executor:
             futures = [
                 executor.submit(extract_candidate, i) for i in range(n_candidates)
             ]

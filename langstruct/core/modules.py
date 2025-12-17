@@ -172,7 +172,10 @@ class EntityExtractor(dspy.Module):
         )
 
     def _parse_llm_sources(
-        self, sources_dict: Dict[str, Any], chunk_offset: int, text: Optional[str] = None
+        self,
+        sources_dict: Dict[str, Any],
+        chunk_offset: int,
+        text: Optional[str] = None,
     ) -> Dict[str, List[SourceSpan]]:
         """Parse source information provided by LLM into SourceSpan objects.
 
@@ -310,7 +313,9 @@ class EntityExtractor(dspy.Module):
 
         return fixed_sources
 
-    def _calculate_confidence(self, is_valid: bool, entities_dict: Dict[str, Any]) -> float:
+    def _calculate_confidence(
+        self, is_valid: bool, entities_dict: Dict[str, Any]
+    ) -> float:
         """Calculate overall extraction confidence score."""
         base_confidence = 0.8 if is_valid else 0.4
 

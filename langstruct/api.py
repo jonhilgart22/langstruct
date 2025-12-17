@@ -512,8 +512,10 @@ class LangStruct:
         pipeline_chunking = None
         try:
             # ExtractionPipeline -> TextChunkerModule -> TextChunker -> ChunkingConfig
-            pipeline_chunking = (
-                getattr(getattr(getattr(self.pipeline, "chunker", None), "chunker", None), "config", None)
+            pipeline_chunking = getattr(
+                getattr(getattr(self.pipeline, "chunker", None), "chunker", None),
+                "config",
+                None,
             )
         except Exception:
             pipeline_chunking = None
@@ -540,7 +542,8 @@ class LangStruct:
                 ),
                 "chunking_config_effective": (
                     pipeline_chunking.model_dump()
-                    if pipeline_chunking is not None and hasattr(pipeline_chunking, "model_dump")
+                    if pipeline_chunking is not None
+                    and hasattr(pipeline_chunking, "model_dump")
                     else None
                 ),
                 "refine_requested": refine,
@@ -548,7 +551,11 @@ class LangStruct:
                     self.refine_config.model_dump()
                     if getattr(self, "refine_config", None) is not None
                     and hasattr(self.refine_config, "model_dump")
-                    else (self.refine_config if getattr(self, "refine_config", None) is not None else None)
+                    else (
+                        self.refine_config
+                        if getattr(self, "refine_config", None) is not None
+                        else None
+                    )
                 ),
             },
         )
