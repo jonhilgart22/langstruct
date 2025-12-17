@@ -276,7 +276,7 @@ def with_parallel_support(func: Callable) -> Callable:
                     f"Success rate: {result.success_rate:.1f}%",
                     UserWarning,
                 )
-                
+
                 if raise_on_failure:
                     result.raise_if_failed()
 

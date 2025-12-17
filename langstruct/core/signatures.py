@@ -137,9 +137,9 @@ class RefineExtraction(dspy.Signature):
 class JudgeExtractions(dspy.Signature):
     """Judge and score multiple extraction candidates.
 
-    Evaluate extraction candidates against a rubric and provide scores
-    and reasoning. Focus on faithfulness to source text, completeness,
-    and accuracy of extracted information.
+    Evaluate extraction candidates against a rubric and provide scores,
+    reasoning, and actionable feedback. Focus on faithfulness to source text,
+    completeness, and accuracy of extracted information.
     """
 
     text: Annotated[str, dspy.InputField(desc="Original source text")]
@@ -152,6 +152,6 @@ class JudgeExtractions(dspy.Signature):
     scores: Annotated[
         str,
         dspy.OutputField(
-            desc="JSON array with score (0-1) and reasoning for each candidate"
+            desc="JSON array with score (0-1), reasoning, and feedback for each candidate. Each item must have: score (float 0-1), reasoning (string explaining the score), feedback (string with specific actionable improvements for the next generation)"
         ),
     ]
