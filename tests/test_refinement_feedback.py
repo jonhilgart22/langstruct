@@ -352,3 +352,173 @@ class TestExtractionRefinerReceivesFeedback:
 
         # Should detect the missing name
         assert "name" in detected.lower() or "missing" in detected.lower()
+
+
+class TestParseRetryWithFeedback:
+    """Test that JSON parse failures are retried with error feedback."""
+
+    def test_refiner_retries_on_json_parse_failure(self, sample_extraction):
+        """Refiner should retry with error feedback when JSON parsing fails."""
+        refiner = ExtractionRefiner(PersonTestSchema)
+
+        call_count = 0
+
+        def mock_refine_side_effect(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            mock_result = MagicMock()
+            if call_count == 1:
+                # First call returns invalid JSON
+                mock_result.refined_extraction = "not valid json {{"
+            else:
+                # Second call returns valid JSON
+                mock_result.refined_extraction = json.dumps(
+                    {"name": "John Doe", "age": 31}
+                )
+            return mock_result
+
+        with patch.object(refiner, "refine", side_effect=mock_refine_side_effect):
+            result = refiner.forward("Sample text", sample_extraction, issues="Fix age")
+
+            # Should have retried and succeeded
+            assert call_count == 2
+            assert result.entities == {"name": "John Doe", "age": 31}
+            assert result.metadata.get("parse_retries") == 1
+
+    def test_refiner_passes_error_in_issues_on_retry(self, sample_extraction):
+        """Refiner should include parse error in issues for retry attempts."""
+        refiner = ExtractionRefiner(PersonTestSchema)
+
+        captured_issues = []
+
+        def mock_refine_side_effect(**kwargs):
+            captured_issues.append(kwargs.get("issues", ""))
+            mock_result = MagicMock()
+            if len(captured_issues) == 1:
+                mock_result.refined_extraction = "bad json"
+            else:
+                mock_result.refined_extraction = json.dumps({"name": "John", "age": 30})
+            return mock_result
+
+        with patch.object(refiner, "refine", side_effect=mock_refine_side_effect):
+            refiner.forward("Sample text", sample_extraction, issues="Fix age")
+
+            # Second call should include error feedback
+            assert len(captured_issues) == 2
+            assert "PREVIOUS ATTEMPT FAILED" in captured_issues[1]
+            assert "JSON parsing failed" in captured_issues[1]
+
+    def test_refiner_returns_original_after_max_retries(self, sample_extraction):
+        """Refiner should return original extraction after exhausting retries."""
+        refiner = ExtractionRefiner(PersonTestSchema)
+
+        with patch.object(refiner, "refine") as mock_refine:
+            mock_result = MagicMock()
+            mock_result.refined_extraction = "always bad json"
+            mock_refine.return_value = mock_result
+
+            with pytest.warns(UserWarning, match="failed to parse after 3 retries"):
+                result = refiner.forward(
+                    "Sample text", sample_extraction, issues="Fix age"
+                )
+
+            # Should return original after 3 retries
+            assert mock_refine.call_count == 3
+            assert result == sample_extraction
+
+    def test_refiner_no_retry_metadata_on_first_success(self, sample_extraction):
+        """No parse_retries metadata when first attempt succeeds."""
+        refiner = ExtractionRefiner(PersonTestSchema)
+
+        with patch.object(refiner, "refine") as mock_refine:
+            mock_result = MagicMock()
+            mock_result.refined_extraction = json.dumps({"name": "John", "age": 30})
+            mock_refine.return_value = mock_result
+
+            result = refiner.forward("Sample text", sample_extraction, issues="Fix age")
+
+            assert mock_refine.call_count == 1
+            assert "parse_retries" not in result.metadata
+
+    def test_builtin_judge_retries_on_json_parse_failure(self, sample_candidates):
+        """BuiltinJudge should retry with error feedback on parse failure."""
+        judge = BuiltinJudge(PersonTestSchema)
+
+        call_count = 0
+
+        def mock_judge_side_effect(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            mock_result = MagicMock()
+            if call_count == 1:
+                mock_result.scores = "invalid json"
+            else:
+                mock_result.scores = json.dumps(
+                    [
+                        {"score": 0.9, "reasoning": "Good", "feedback": "OK"},
+                        {"score": 0.7, "reasoning": "Fine", "feedback": "OK"},
+                    ]
+                )
+            return mock_result
+
+        with patch.object(judge, "judge", side_effect=mock_judge_side_effect):
+            scores = judge.forward("Sample text", sample_candidates)
+
+            assert call_count == 2
+            assert len(scores) == 2
+            assert scores[0][0] == 0.9
+
+    def test_builtin_judge_includes_error_in_rubric_on_retry(self, sample_candidates):
+        """BuiltinJudge should include parse error in rubric for retry."""
+        judge = BuiltinJudge(PersonTestSchema)
+
+        captured_rubrics = []
+
+        def mock_judge_side_effect(**kwargs):
+            captured_rubrics.append(kwargs.get("rubric", ""))
+            mock_result = MagicMock()
+            if len(captured_rubrics) == 1:
+                mock_result.scores = "not json"
+            else:
+                mock_result.scores = json.dumps(
+                    [
+                        {"score": 0.9, "reasoning": "Good", "feedback": "OK"},
+                        {"score": 0.7, "reasoning": "Fine", "feedback": "OK"},
+                    ]
+                )
+            return mock_result
+
+        with patch.object(judge, "judge", side_effect=mock_judge_side_effect):
+            judge.forward("Sample text", sample_candidates)
+
+            assert len(captured_rubrics) == 2
+            assert "CRITICAL" in captured_rubrics[1]
+            assert "not valid JSON" in captured_rubrics[1]
+
+    def test_custom_judge_retries_on_json_parse_failure(self, sample_candidates):
+        """CustomJudge should retry with error feedback on parse failure."""
+        judge = CustomJudge(PersonTestSchema, "Custom rubric")
+
+        call_count = 0
+
+        def mock_judge_side_effect(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            mock_result = MagicMock()
+            if call_count == 1:
+                mock_result.scores = "invalid json"
+            else:
+                mock_result.scores = json.dumps(
+                    [
+                        {"score": 0.85, "reasoning": "Good", "feedback": "OK"},
+                        {"score": 0.65, "reasoning": "Fine", "feedback": "OK"},
+                    ]
+                )
+            return mock_result
+
+        with patch.object(judge, "judge", side_effect=mock_judge_side_effect):
+            scores = judge.forward("Sample text", sample_candidates)
+
+            assert call_count == 2
+            assert len(scores) == 2
+            assert scores[0][0] == 0.85

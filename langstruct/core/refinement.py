@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
+from .constants import MAX_PARSE_RETRIES
 from .schema_utils import get_field_descriptions, get_json_schema
 from .schemas import ExtractionResult, SourceSpan
 from .signatures import (
@@ -206,34 +207,58 @@ class BuiltinJudge(dspy.Module):
             "For each candidate, provide specific actionable feedback on how to improve the extraction."
         )
 
-        result = self.judge(
-            text=text,
-            candidates=candidates_json,
-            schema_spec=schema_json,
-            rubric=built_in_rubric,
-        )
+        max_parse_retries = MAX_PARSE_RETRIES
+        effective_rubric = built_in_rubric
 
-        try:
-            scores_data = json.loads(result.scores)
-            if isinstance(scores_data, list):
-                return [
-                    (
-                        item.get("score", 0.5),
-                        item.get("reasoning", ""),
-                        item.get("feedback", "No specific feedback provided"),
-                    )
-                    for item in scores_data
-                ]
-            else:
-                # Fallback if format is unexpected
-                return [
-                    (0.5, "Judge output format unexpected", "No feedback available")
-                ] * len(candidates)
-        except (json.JSONDecodeError, AttributeError):
-            warnings.warn("Judge output could not be parsed, using fallback scores")
-            return [(0.5, "Judge parsing failed", "No feedback available")] * len(
-                candidates
+        for attempt in range(max_parse_retries):
+            result = self.judge(
+                text=text,
+                candidates=candidates_json,
+                schema_spec=schema_json,
+                rubric=effective_rubric,
             )
+
+            try:
+                scores_data = json.loads(result.scores)
+                if isinstance(scores_data, list):
+                    return [
+                        (
+                            item.get("score", 0.5),
+                            item.get("reasoning", ""),
+                            item.get("feedback", "No specific feedback provided"),
+                        )
+                        for item in scores_data
+                    ]
+                else:
+                    # Fallback if format is unexpected
+                    return [
+                        (0.5, "Judge output format unexpected", "No feedback available")
+                    ] * len(candidates)
+            except (json.JSONDecodeError, AttributeError) as e:
+                error_msg = (
+                    f"JSON parsing failed: {e}\n"
+                    f"Invalid output: {result.scores[:500] if hasattr(result, 'scores') else 'N/A'}"
+                )
+                effective_rubric = (
+                    f"{built_in_rubric}\n\n"
+                    f"CRITICAL: Your previous response was not valid JSON. "
+                    f"You MUST return a valid JSON array. Error: {error_msg}"
+                )
+                if attempt < max_parse_retries - 1:
+                    logger.warning(
+                        "Judge parse failed, retry %d/%d: %s",
+                        attempt + 1,
+                        max_parse_retries,
+                        str(e),
+                    )
+                else:
+                    warnings.warn(
+                        f"Judge output could not be parsed after {max_parse_retries} retries, "
+                        "using fallback scores"
+                    )
+                    return [
+                        (0.5, "Judge parsing failed", "No feedback available")
+                    ] * len(candidates)
 
 
 class CustomJudge(dspy.Module):
@@ -282,35 +307,57 @@ class CustomJudge(dspy.Module):
             "For each candidate, provide specific actionable feedback on how to improve the extraction."
         )
 
-        result = self.judge(
-            text=text,
-            candidates=candidates_json,
-            schema_spec=schema_json,
-            rubric=rubric_with_feedback,
-        )
+        max_parse_retries = MAX_PARSE_RETRIES
+        effective_rubric = rubric_with_feedback
 
-        try:
-            scores_data = json.loads(result.scores)
-            if isinstance(scores_data, list):
-                return [
-                    (
-                        item.get("score", 0.5),
-                        item.get("reasoning", ""),
-                        item.get("feedback", "No specific feedback provided"),
+        for attempt in range(max_parse_retries):
+            result = self.judge(
+                text=text,
+                candidates=candidates_json,
+                schema_spec=schema_json,
+                rubric=effective_rubric,
+            )
+
+            try:
+                scores_data = json.loads(result.scores)
+                if isinstance(scores_data, list):
+                    return [
+                        (
+                            item.get("score", 0.5),
+                            item.get("reasoning", ""),
+                            item.get("feedback", "No specific feedback provided"),
+                        )
+                        for item in scores_data
+                    ]
+                else:
+                    return [
+                        (0.5, "Judge output format unexpected", "No feedback available")
+                    ] * len(candidates)
+            except (json.JSONDecodeError, AttributeError) as e:
+                error_msg = (
+                    f"JSON parsing failed: {e}\n"
+                    f"Invalid output: {result.scores[:500] if hasattr(result, 'scores') else 'N/A'}"
+                )
+                effective_rubric = (
+                    f"{rubric_with_feedback}\n\n"
+                    f"CRITICAL: Your previous response was not valid JSON. "
+                    f"You MUST return a valid JSON array. Error: {error_msg}"
+                )
+                if attempt < max_parse_retries - 1:
+                    logger.warning(
+                        "Custom judge parse failed, retry %d/%d: %s",
+                        attempt + 1,
+                        max_parse_retries,
+                        str(e),
                     )
-                    for item in scores_data
-                ]
-            else:
-                return [
-                    (0.5, "Judge output format unexpected", "No feedback available")
-                ] * len(candidates)
-        except (json.JSONDecodeError, AttributeError):
-            warnings.warn(
-                "Custom judge output could not be parsed, using fallback scores"
-            )
-            return [(0.5, "Judge parsing failed", "No feedback available")] * len(
-                candidates
-            )
+                else:
+                    warnings.warn(
+                        f"Custom judge output could not be parsed after {max_parse_retries} retries, "
+                        "using fallback scores"
+                    )
+                    return [
+                        (0.5, "Judge parsing failed", "No feedback available")
+                    ] * len(candidates)
 
 
 class ExtractionRefiner(dspy.Module):
@@ -326,6 +373,7 @@ class ExtractionRefiner(dspy.Module):
         text: str,
         current_extraction: ExtractionResult,
         issues: Optional[str] = None,
+        max_parse_retries: int = MAX_PARSE_RETRIES,
     ) -> ExtractionResult:
         """Refine an extraction by addressing specific issues.
 
@@ -333,6 +381,7 @@ class ExtractionRefiner(dspy.Module):
             text: Original text
             current_extraction: Current extraction to refine
             issues: Specific issues to address (auto-detected if None)
+            max_parse_retries: Max retries when LLM returns invalid JSON
 
         Returns:
             Refined extraction result
@@ -344,33 +393,59 @@ class ExtractionRefiner(dspy.Module):
         if issues is None:
             issues = self._detect_issues(text, current_extraction)
 
-        result = self.refine(
-            text=text,
-            current_extraction=current_json,
-            schema_spec=schema_json,
-            issues=issues,
-        )
+        current_issues = issues
+        for attempt in range(max_parse_retries):
+            result = self.refine(
+                text=text,
+                current_extraction=current_json,
+                schema_spec=schema_json,
+                issues=current_issues,
+            )
 
-        try:
-            refined_entities = json.loads(result.refined_extraction)
-        except json.JSONDecodeError:
-            warnings.warn("Refinement failed to parse, returning original")
-            return current_extraction
+            try:
+                refined_entities = json.loads(result.refined_extraction)
+            except json.JSONDecodeError as e:
+                error_msg = (
+                    f"JSON parsing failed: {e}\n\n"
+                    f"Invalid output:\n{result.refined_extraction[:500]}"
+                )
+                current_issues = (
+                    f"{issues}\n\n"
+                    f"PREVIOUS ATTEMPT FAILED - You MUST fix this error:\n{error_msg}"
+                )
+                if attempt < max_parse_retries - 1:
+                    logger.warning(
+                        "Refinement parse failed, retry %d/%d: %s",
+                        attempt + 1,
+                        max_parse_retries,
+                        str(e),
+                    )
+                    continue
+                else:
+                    warnings.warn(
+                        f"Refinement failed to parse after {max_parse_retries} retries, "
+                        "returning original"
+                    )
+                    return current_extraction
 
-        # Create new extraction result with refined entities
-        # Keep original sources for now (could be improved with source refinement)
-        return ExtractionResult(
-            entities=refined_entities,
-            sources=current_extraction.sources,  # TODO: Could refine sources too
-            confidence=min(
-                current_extraction.confidence + 0.1, 1.0
-            ),  # Slight confidence boost
-            metadata={
-                **current_extraction.metadata,
-                "refined": True,
-                "refinement_issues": issues,
-            },
-        )
+            # Create new extraction result with refined entities
+            # Keep original sources for now (could be improved with source refinement)
+            return ExtractionResult(
+                entities=refined_entities,
+                sources=current_extraction.sources,  # TODO: Could refine sources too
+                confidence=min(
+                    current_extraction.confidence + 0.1, 1.0
+                ),  # Slight confidence boost
+                metadata={
+                    **current_extraction.metadata,
+                    "refined": True,
+                    "refinement_issues": issues,
+                    **({"parse_retries": attempt} if attempt > 0 else {}),
+                },
+            )
+
+        # Should not reach here, but just in case
+        return current_extraction
 
     def _detect_issues(self, text: str, extraction: ExtractionResult) -> str:
         """Auto-detect issues in current extraction."""

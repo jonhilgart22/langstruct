@@ -2,6 +2,7 @@
 
 import json
 import logging
+import warnings
 from enum import Enum
 from typing import Any, Dict, List, Optional, Type, Union
 
@@ -9,6 +10,7 @@ import dspy
 from pydantic import BaseModel, ValidationError
 
 from .chunking import ChunkingConfig, TextChunk, TextChunker
+from .constants import MAX_PARSE_RETRIES
 from .grounding import SourceGrounder
 from .schema_utils import get_field_descriptions, get_json_schema
 from .schemas import ChunkResult, ExtractionResult, ParsedQuery, SourceSpan
@@ -107,23 +109,50 @@ class EntityExtractor(dspy.Module):
             if effective_reasoning == ReasoningMode.COT
             else self._extract_predict
         )
-        if self.use_sources:
-            result = extractor(text=text, schema_spec=schema_json)
-            entities_json = result.entities
-            sources_json = getattr(result, "sources", "{}")
-        else:
-            result = extractor(text=text, schema_spec=schema_json)
-            entities_json = result.entities
-            sources_json = "{}"
 
-        # Parse extracted entities
-        try:
-            entities_dict = json.loads(entities_json)
-            sources_dict = json.loads(sources_json)
-        except json.JSONDecodeError:
-            # Fallback to empty result if JSON parsing fails
-            entities_dict = {}
-            sources_dict = {}
+        max_parse_retries = MAX_PARSE_RETRIES
+        entities_dict = {}
+        sources_dict = {}
+        effective_schema_json = schema_json
+
+        for attempt in range(max_parse_retries):
+            if self.use_sources:
+                result = extractor(text=text, schema_spec=effective_schema_json)
+                entities_json = result.entities
+                sources_json = getattr(result, "sources", "{}")
+            else:
+                result = extractor(text=text, schema_spec=effective_schema_json)
+                entities_json = result.entities
+                sources_json = "{}"
+
+            # Parse extracted entities
+            try:
+                entities_dict = json.loads(entities_json)
+                sources_dict = json.loads(sources_json)
+                break  # Success
+            except json.JSONDecodeError as e:
+                error_msg = (
+                    f"JSON parsing failed: {e}\n"
+                    f"Invalid output: {entities_json[:500]}"
+                )
+                # Append error feedback to schema spec for next attempt
+                effective_schema_json = (
+                    f"{schema_json}\n\n"
+                    f"CRITICAL: Your previous response was not valid JSON. "
+                    f"You MUST return valid JSON. Error: {error_msg}"
+                )
+                if attempt < max_parse_retries - 1:
+                    logger.warning(
+                        "Extraction parse failed, retry %d/%d: %s",
+                        attempt + 1,
+                        max_parse_retries,
+                        str(e),
+                    )
+                else:
+                    warnings.warn(
+                        f"Extraction failed to parse after {max_parse_retries} retries, "
+                        "using empty result"
+                    )
 
         # Validate extraction using DSPy (optional)
         if run_validation:
@@ -376,16 +405,42 @@ class ResultAggregator(dspy.Module):
 
         schema_json = json.dumps(get_json_schema(self.schema), indent=2)
 
-        # Use DSPy to intelligently combine extractions
-        summary_result = self.summarize(
-            extractions=extractions_json, schema_spec=schema_json
-        )
+        # Use DSPy to intelligently combine extractions with retry on parse failure
+        max_parse_retries = MAX_PARSE_RETRIES
+        combined_entities = None
+        effective_schema_json = schema_json
 
-        try:
-            combined_entities = json.loads(summary_result.summary)
-        except json.JSONDecodeError:
-            # Fallback: conservatively merge entities across chunks
-            combined_entities = self._conservative_merge(chunk_results)
+        for attempt in range(max_parse_retries):
+            summary_result = self.summarize(
+                extractions=extractions_json, schema_spec=effective_schema_json
+            )
+
+            try:
+                combined_entities = json.loads(summary_result.summary)
+                break  # Success
+            except json.JSONDecodeError as e:
+                error_msg = (
+                    f"JSON parsing failed: {e}\n"
+                    f"Invalid output: {summary_result.summary[:500]}"
+                )
+                effective_schema_json = (
+                    f"{schema_json}\n\n"
+                    f"CRITICAL: Your previous response was not valid JSON. "
+                    f"You MUST return valid JSON. Error: {error_msg}"
+                )
+                if attempt < max_parse_retries - 1:
+                    logger.warning(
+                        "Aggregation parse failed, retry %d/%d: %s",
+                        attempt + 1,
+                        max_parse_retries,
+                        str(e),
+                    )
+                else:
+                    warnings.warn(
+                        f"Aggregation failed to parse after {max_parse_retries} retries, "
+                        "using conservative merge"
+                    )
+                    combined_entities = self._conservative_merge(chunk_results)
 
         # Combine source locations from all chunks
         combined_sources = self._merge_sources(chunk_results)
