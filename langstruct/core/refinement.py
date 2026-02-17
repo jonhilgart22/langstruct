@@ -428,14 +428,20 @@ class ExtractionRefiner(dspy.Module):
                     )
                     return current_extraction
 
+            # Only boost confidence if refinement actually changed entities
+            entities_changed = refined_entities != current_extraction.entities
+            new_confidence = (
+                min(current_extraction.confidence + 0.1, 1.0)
+                if entities_changed
+                else current_extraction.confidence
+            )
+
             # Create new extraction result with refined entities
             # Keep original sources for now (could be improved with source refinement)
             return ExtractionResult(
                 entities=refined_entities,
                 sources=current_extraction.sources,  # TODO: Could refine sources too
-                confidence=min(
-                    current_extraction.confidence + 0.1, 1.0
-                ),  # Slight confidence boost
+                confidence=new_confidence,
                 metadata={
                     **current_extraction.metadata,
                     "refined": True,
@@ -451,11 +457,23 @@ class ExtractionRefiner(dspy.Module):
         """Auto-detect issues in current extraction."""
         issues = []
 
-        # Check for empty required fields
+        schema_fields = get_field_descriptions(self.schema)
+
+        # Check for fields defined in the schema but completely missing from extraction
+        for field_name in schema_fields:
+            if field_name not in extraction.entities:
+                issues.append(
+                    f"Missing field '{field_name}' (expected by schema but not present in extraction)"
+                )
+
+        # Check for empty/null values in fields that are present
         for field_name, value in extraction.entities.items():
-            if not value or (isinstance(value, str) and not value.strip()):
-                if field_name in get_field_descriptions(self.schema):
+            if value is None or (isinstance(value, str) and not value.strip()):
+                if field_name in schema_fields:
                     issues.append(f"Missing value for required field: {field_name}")
+            elif isinstance(value, (list, dict)) and not value:
+                if field_name in schema_fields:
+                    issues.append(f"Empty collection for required field: {field_name}")
 
         # Check source-value alignment
         for field_name, value in extraction.entities.items():
@@ -482,13 +500,15 @@ class RefinementEngine(dspy.Module):
         self.refiner = ExtractionRefiner(schema)
 
     def forward(
-        self, text: str, refine_config: Refine
+        self, text: str, refine_config: Refine, run_validation: bool = False
     ) -> Tuple[ExtractionResult, RefinementTrace]:
         """Run refinement process based on configuration.
 
         Args:
             text: Input text to extract from
             refine_config: Refinement configuration
+            run_validation: Whether to run LLM validation inside EntityExtractor
+                (default False to avoid wasted LLM calls during refinement)
 
         Returns:
             Tuple of (best_result, trace_info)
@@ -530,7 +550,7 @@ class RefinementEngine(dspy.Module):
             calls_used, tokens_used
         ):
             # Return basic extraction if budget exceeded
-            basic_result = self.extractor(text)
+            basic_result = self.extractor(text, run_validation=run_validation)
             return basic_result, trace
 
         candidates = []
@@ -546,7 +566,10 @@ class RefinementEngine(dspy.Module):
                 refine_config.temperature,
             )
             candidates = self._generate_candidates(
-                text, refine_config.n_candidates, refine_config.temperature
+                text,
+                refine_config.n_candidates,
+                refine_config.temperature,
+                run_validation=run_validation,
             )
             calls_used += len(candidates)
             logger.info(
@@ -562,12 +585,16 @@ class RefinementEngine(dspy.Module):
                 warnings.warn(
                     "Budget exceeded after candidate generation, using first candidate"
                 )
-                best_result = candidates[0] if candidates else self.extractor(text)
+                best_result = (
+                    candidates[0]
+                    if candidates
+                    else self.extractor(text, run_validation=run_validation)
+                )
                 trace.budget_used = {"calls": calls_used, "tokens": tokens_used}
                 return best_result, trace
         else:
             # For refine-only strategy, start with single extraction
-            candidates = [self.extractor(text)]
+            candidates = [self.extractor(text, run_validation=run_validation)]
             calls_used += 1
 
         # Step 2: Judge candidates and select best
@@ -702,7 +729,11 @@ class RefinementEngine(dspy.Module):
         return best_candidate, trace
 
     def _generate_candidates(
-        self, text: str, n_candidates: int, temperature: float
+        self,
+        text: str,
+        n_candidates: int,
+        temperature: float,
+        run_validation: bool = False,
     ) -> List[ExtractionResult]:
         """Generate multiple extraction candidates with diversity.
 
@@ -711,7 +742,7 @@ class RefinementEngine(dspy.Module):
         """
         if n_candidates == 1:
             # No need for parallel execution with single candidate
-            return [self.extractor(text)]
+            return [self.extractor(text, run_validation=run_validation)]
 
         def extract_candidate(candidate_idx: int) -> Tuple[int, ExtractionResult]:
             """Extract a single candidate, returning index for ordering."""
@@ -720,7 +751,7 @@ class RefinementEngine(dspy.Module):
                 candidate_idx + 1,
                 n_candidates,
             )
-            result = self.extractor(text)
+            result = self.extractor(text, run_validation=run_validation)
             logger.info(
                 "RefinementEngine candidate %d/%d complete confidence=%.3f",
                 candidate_idx + 1,

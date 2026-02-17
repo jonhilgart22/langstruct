@@ -560,58 +560,47 @@ class LangStruct:
             },
         )
 
-        # Optionally override source grounding for this call only
-        overridden = False
-        previous_use_sources = None
-        try:
-            if (
-                return_sources is not None
-                and hasattr(self.pipeline, "extractor")
-                and hasattr(self.pipeline.extractor, "use_sources")
-            ):
-                previous_use_sources = getattr(self.pipeline.extractor, "use_sources")
-                setattr(self.pipeline.extractor, "use_sources", bool(return_sources))
-                overridden = True
-
-            # Run extraction pipeline (call bound __call__ so tests can patch it)
-            # NOTE: some tests monkeypatch `ExtractionPipeline` with mocks that do
-            # not accept `run_validation`/`reasoning`, so fall back gracefully.
-            try:
-                result = self.pipeline.__call__(
-                    text, run_validation=run_validation, reasoning=reasoning
-                )
-            except TypeError:
-                result = self.pipeline.__call__(text)
-        finally:
-            # Restore previous setting if we overrode it
-            if (
-                overridden
-                and previous_use_sources is not None
-                and hasattr(self.pipeline, "extractor")
-                and hasattr(self.pipeline.extractor, "use_sources")
-            ):
-                setattr(self.pipeline.extractor, "use_sources", previous_use_sources)
-
-        # Apply refinement if requested
+        # Determine if refinement will run (so we can skip the pipeline call)
         refine_trace = None
+        effective_refine = None
         if refine is not None or self.refine_config:
-            # Parse refine configuration for this call
             effective_refine = (
                 self._parse_refine_config(refine)
                 if refine is not None
                 else self.refine_config
             )
 
-            if effective_refine:
+        if effective_refine:
+            # Refinement will do its own extraction from scratch, so skip
+            # the pipeline call entirely to avoid a wasted LLM call.
+            # Apply source grounding override for the refinement engine's
+            # extractor (same object as self.pipeline.extractor).
+            overridden = False
+            previous_use_sources = None
+            try:
+                if (
+                    return_sources is not None
+                    and hasattr(self.pipeline, "extractor")
+                    and hasattr(self.pipeline.extractor, "use_sources")
+                ):
+                    previous_use_sources = getattr(
+                        self.pipeline.extractor, "use_sources"
+                    )
+                    setattr(
+                        self.pipeline.extractor, "use_sources", bool(return_sources)
+                    )
+                    overridden = True
+
                 # Lazily initialize refinement engine if not already created
                 if self.refinement_engine is None:
                     self.refinement_engine = RefinementEngine(
                         self.schema, self.pipeline.extractor
                     )
 
-                # Run refinement process
-                refined_result, trace = self.refinement_engine(text, effective_refine)
-                result = refined_result
+                # Run refinement process (includes its own initial extraction)
+                result, trace = self.refinement_engine(
+                    text, effective_refine, run_validation=run_validation
+                )
                 refine_trace = trace
 
                 # Add refinement metadata
@@ -624,6 +613,54 @@ class LangStruct:
                         "refinement_budget_used": trace.budget_used,
                     }
                 )
+            finally:
+                if (
+                    overridden
+                    and previous_use_sources is not None
+                    and hasattr(self.pipeline, "extractor")
+                    and hasattr(self.pipeline.extractor, "use_sources")
+                ):
+                    setattr(
+                        self.pipeline.extractor, "use_sources", previous_use_sources
+                    )
+        else:
+            # No refinement — run the pipeline normally
+            overridden = False
+            previous_use_sources = None
+            try:
+                if (
+                    return_sources is not None
+                    and hasattr(self.pipeline, "extractor")
+                    and hasattr(self.pipeline.extractor, "use_sources")
+                ):
+                    previous_use_sources = getattr(
+                        self.pipeline.extractor, "use_sources"
+                    )
+                    setattr(
+                        self.pipeline.extractor, "use_sources", bool(return_sources)
+                    )
+                    overridden = True
+
+                # Run extraction pipeline (call bound __call__ so tests can patch it)
+                # NOTE: some tests monkeypatch `ExtractionPipeline` with mocks that do
+                # not accept `run_validation`/`reasoning`, so fall back gracefully.
+                try:
+                    result = self.pipeline.__call__(
+                        text, run_validation=run_validation, reasoning=reasoning
+                    )
+                except TypeError:
+                    result = self.pipeline.__call__(text)
+            finally:
+                # Restore previous setting if we overrode it
+                if (
+                    overridden
+                    and previous_use_sources is not None
+                    and hasattr(self.pipeline, "extractor")
+                    and hasattr(self.pipeline.extractor, "use_sources")
+                ):
+                    setattr(
+                        self.pipeline.extractor, "use_sources", previous_use_sources
+                    )
 
         # Filter by confidence threshold
         if result.confidence < confidence_threshold:
