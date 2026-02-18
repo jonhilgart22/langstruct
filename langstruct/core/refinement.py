@@ -6,7 +6,7 @@ import logging
 import warnings
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Type, Union
 
 import dspy
 from pydantic import BaseModel, Field
@@ -20,6 +20,8 @@ from .signatures import (
     ExtractEntities,
     ExtractWithSources,
     JudgeExtractions,
+    JudgeScoreItem,
+    JudgeScores,
     RefineExtraction,
 )
 
@@ -144,6 +146,10 @@ class CandidateResult(BaseModel):
     feedback: str = Field(
         description="Actionable feedback for improving the extraction"
     )
+    findings: Literal["NO_ISSUES", "ISSUES"] = Field(
+        default="ISSUES",
+        description="NO_ISSUES if extraction is correct and complete, ISSUES if problems were found",
+    )
     candidate_id: int = Field(description="Candidate identifier")
 
 
@@ -166,10 +172,10 @@ class BuiltinJudge(dspy.Module):
 
     def forward(
         self, text: str, candidates: List[ExtractionResult]
-    ) -> List[Tuple[float, str, str]]:
+    ) -> List[Tuple[float, str, str, str]]:
         """Score candidates using built-in rubric.
 
-        Returns list of (score, reasoning, feedback) tuples.
+        Returns list of (score, reasoning, feedback, findings) tuples.
         """
         if not candidates:
             return []
@@ -204,61 +210,34 @@ class BuiltinJudge(dspy.Module):
             "3. Source quality: Source spans should contain the complete extracted values\n"
             "4. No hallucination: Never extract values not present in the original text\n"
             "Prefer candidates that exactly quote from the text over those that paraphrase.\n\n"
-            "For each candidate, provide specific actionable feedback on how to improve the extraction."
+            "For each candidate, provide specific actionable feedback on how to improve the extraction.\n"
+            "Set findings to NO_ISSUES if the extraction is correct and complete, or ISSUES if problems were found."
         )
 
-        max_parse_retries = MAX_PARSE_RETRIES
-        effective_rubric = built_in_rubric
-
-        for attempt in range(max_parse_retries):
+        try:
             result = self.judge(
                 text=text,
                 candidates=candidates_json,
                 schema_spec=schema_json,
-                rubric=effective_rubric,
+                rubric=built_in_rubric,
             )
 
-            try:
-                scores_data = json.loads(result.scores)
-                if isinstance(scores_data, list):
-                    return [
-                        (
-                            item.get("score", 0.5),
-                            item.get("reasoning", ""),
-                            item.get("feedback", "No specific feedback provided"),
-                        )
-                        for item in scores_data
-                    ]
-                else:
-                    # Fallback if format is unexpected
-                    return [
-                        (0.5, "Judge output format unexpected", "No feedback available")
-                    ] * len(candidates)
-            except (json.JSONDecodeError, AttributeError) as e:
-                error_msg = (
-                    f"JSON parsing failed: {e}\n"
-                    f"Invalid output: {result.scores[:500] if hasattr(result, 'scores') else 'N/A'}"
+            # DSPy returns a typed JudgeScores instance
+            judge_scores: JudgeScores = result.scores
+            return [
+                (
+                    item.score,
+                    item.reasoning,
+                    item.feedback,
+                    item.findings,
                 )
-                effective_rubric = (
-                    f"{built_in_rubric}\n\n"
-                    f"CRITICAL: Your previous response was not valid JSON. "
-                    f"You MUST return a valid JSON array. Error: {error_msg}"
-                )
-                if attempt < max_parse_retries - 1:
-                    logger.warning(
-                        "Judge parse failed, retry %d/%d: %s",
-                        attempt + 1,
-                        max_parse_retries,
-                        str(e),
-                    )
-                else:
-                    warnings.warn(
-                        f"Judge output could not be parsed after {max_parse_retries} retries, "
-                        "using fallback scores"
-                    )
-                    return [
-                        (0.5, "Judge parsing failed", "No feedback available")
-                    ] * len(candidates)
+                for item in judge_scores.scores
+            ]
+        except Exception as e:
+            logger.warning("Judge call failed: %s", str(e))
+            return [
+                (0.5, "Judge call failed", "No feedback available", "ISSUES")
+            ] * len(candidates)
 
 
 class CustomJudge(dspy.Module):
@@ -272,10 +251,10 @@ class CustomJudge(dspy.Module):
 
     def forward(
         self, text: str, candidates: List[ExtractionResult]
-    ) -> List[Tuple[float, str, str]]:
+    ) -> List[Tuple[float, str, str, str]]:
         """Score candidates using custom rubric.
 
-        Returns list of (score, reasoning, feedback) tuples.
+        Returns list of (score, reasoning, feedback, findings) tuples.
         """
         if not candidates:
             return []
@@ -304,60 +283,34 @@ class CustomJudge(dspy.Module):
         # Append feedback instruction to custom rubric
         rubric_with_feedback = (
             f"{self.rubric}\n\n"
-            "For each candidate, provide specific actionable feedback on how to improve the extraction."
+            "For each candidate, provide specific actionable feedback on how to improve the extraction.\n"
+            "Set findings to NO_ISSUES if the extraction is correct and complete, or ISSUES if problems were found."
         )
 
-        max_parse_retries = MAX_PARSE_RETRIES
-        effective_rubric = rubric_with_feedback
-
-        for attempt in range(max_parse_retries):
+        try:
             result = self.judge(
                 text=text,
                 candidates=candidates_json,
                 schema_spec=schema_json,
-                rubric=effective_rubric,
+                rubric=rubric_with_feedback,
             )
 
-            try:
-                scores_data = json.loads(result.scores)
-                if isinstance(scores_data, list):
-                    return [
-                        (
-                            item.get("score", 0.5),
-                            item.get("reasoning", ""),
-                            item.get("feedback", "No specific feedback provided"),
-                        )
-                        for item in scores_data
-                    ]
-                else:
-                    return [
-                        (0.5, "Judge output format unexpected", "No feedback available")
-                    ] * len(candidates)
-            except (json.JSONDecodeError, AttributeError) as e:
-                error_msg = (
-                    f"JSON parsing failed: {e}\n"
-                    f"Invalid output: {result.scores[:500] if hasattr(result, 'scores') else 'N/A'}"
+            # DSPy returns a typed JudgeScores instance
+            judge_scores: JudgeScores = result.scores
+            return [
+                (
+                    item.score,
+                    item.reasoning,
+                    item.feedback,
+                    item.findings,
                 )
-                effective_rubric = (
-                    f"{rubric_with_feedback}\n\n"
-                    f"CRITICAL: Your previous response was not valid JSON. "
-                    f"You MUST return a valid JSON array. Error: {error_msg}"
-                )
-                if attempt < max_parse_retries - 1:
-                    logger.warning(
-                        "Custom judge parse failed, retry %d/%d: %s",
-                        attempt + 1,
-                        max_parse_retries,
-                        str(e),
-                    )
-                else:
-                    warnings.warn(
-                        f"Custom judge output could not be parsed after {max_parse_retries} retries, "
-                        "using fallback scores"
-                    )
-                    return [
-                        (0.5, "Judge parsing failed", "No feedback available")
-                    ] * len(candidates)
+                for item in judge_scores.scores
+            ]
+        except Exception as e:
+            logger.warning("Custom judge call failed: %s", str(e))
+            return [
+                (0.5, "Judge call failed", "No feedback available", "ISSUES")
+            ] * len(candidates)
 
 
 class ExtractionRefiner(dspy.Module):
@@ -614,7 +567,7 @@ class RefinementEngine(dspy.Module):
             )
 
             # Create candidate results with scores
-            for i, (candidate, (score, reasoning, feedback)) in enumerate(
+            for i, (candidate, (score, reasoning, feedback, findings)) in enumerate(
                 zip(candidates, scores)
             ):
                 trace.candidates.append(
@@ -623,6 +576,7 @@ class RefinementEngine(dspy.Module):
                         score=score,
                         reasoning=reasoning,
                         feedback=feedback,
+                        findings=findings,
                         candidate_id=i,
                     )
                 )
@@ -631,16 +585,19 @@ class RefinementEngine(dspy.Module):
             best_idx = max(range(len(scores)), key=lambda i: scores[i][0])
             best_candidate = candidates[best_idx]
             best_feedback = scores[best_idx][2]  # Get feedback for the best candidate
+            best_findings = scores[best_idx][3]  # Get findings for the best candidate
             trace.chosen_candidate = best_idx
         else:
             best_candidate = candidates[0]
             best_feedback = "General quality improvement needed"
+            best_findings = "ISSUES"  # Default to ISSUES for single candidate
             trace.candidates.append(
                 CandidateResult(
                     extraction=best_candidate,
                     score=best_candidate.confidence,
                     reasoning="Single candidate",
                     feedback=best_feedback,
+                    findings=best_findings,
                     candidate_id=0,
                 )
             )
@@ -651,6 +608,14 @@ class RefinementEngine(dspy.Module):
             RefinementStrategy.REFINE,
             RefinementStrategy.BON_THEN_REFINE,
         ]:
+            # Skip refinement if judge found no issues with best candidate
+            if best_findings == "NO_ISSUES":
+                logger.info(
+                    "RefinementEngine skipping refinement: judge found NO_ISSUES for best candidate"
+                )
+                trace.budget_used = {"calls": calls_used, "tokens": tokens_used}
+                return best_candidate, trace
+
             logger.info(
                 "RefinementEngine starting refinement steps max_steps=%d feedback=%s",
                 refine_config.max_refine_steps,

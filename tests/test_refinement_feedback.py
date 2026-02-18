@@ -18,6 +18,7 @@ from langstruct.core.refinement import (
     RefinementTrace,
 )
 from langstruct.core.schemas import ExtractionResult, SourceSpan
+from langstruct.core.signatures import JudgeScoreItem, JudgeScores
 
 
 class PersonTestSchema(BaseModel):
@@ -88,28 +89,30 @@ class TestJudgeFeedbackReturn:
     """Test that judges return feedback in their tuples."""
 
     def test_builtin_judge_returns_feedback_tuple(self, sample_candidates):
-        """BuiltinJudge should return (score, reasoning, feedback) tuples."""
+        """BuiltinJudge should return (score, reasoning, feedback, findings) tuples."""
         judge = BuiltinJudge(PersonTestSchema)
 
-        # Mock the DSPy judge call
-        mock_scores = json.dumps(
-            [
-                {
-                    "score": 0.9,
-                    "reasoning": "Good extraction with accurate values",
-                    "feedback": "Consider adding source span for middle name",
-                },
-                {
-                    "score": 0.7,
-                    "reasoning": "Missing some details",
-                    "feedback": "Verify age against document header",
-                },
+        # Mock the DSPy judge call with structured JudgeScores output
+        mock_judge_scores = JudgeScores(
+            scores=[
+                JudgeScoreItem(
+                    score=0.9,
+                    reasoning="Good extraction with accurate values",
+                    feedback="Consider adding source span for middle name",
+                    findings="ISSUES",
+                ),
+                JudgeScoreItem(
+                    score=0.7,
+                    reasoning="Missing some details",
+                    feedback="Verify age against document header",
+                    findings="ISSUES",
+                ),
             ]
         )
 
         with patch.object(judge, "judge") as mock_judge:
             mock_result = MagicMock()
-            mock_result.scores = mock_scores
+            mock_result.scores = mock_judge_scores
             mock_judge.return_value = mock_result
 
             scores = judge.forward(
@@ -117,61 +120,66 @@ class TestJudgeFeedbackReturn:
             )
 
             assert len(scores) == 2
-            # Each score should be a 3-tuple: (score, reasoning, feedback)
-            assert len(scores[0]) == 3
-            assert len(scores[1]) == 3
+            # Each score should be a 4-tuple: (score, reasoning, feedback, findings)
+            assert len(scores[0]) == 4
+            assert len(scores[1]) == 4
 
             # Verify feedback is extracted
             assert scores[0][2] == "Consider adding source span for middle name"
             assert scores[1][2] == "Verify age against document header"
+            # Verify findings
+            assert scores[0][3] == "ISSUES"
+            assert scores[1][3] == "ISSUES"
 
     def test_custom_judge_returns_feedback_tuple(self, sample_candidates):
-        """CustomJudge should return (score, reasoning, feedback) tuples."""
+        """CustomJudge should return (score, reasoning, feedback, findings) tuples."""
         custom_rubric = "Focus on name accuracy"
         judge = CustomJudge(PersonTestSchema, custom_rubric)
 
-        mock_scores = json.dumps(
-            [
-                {
-                    "score": 0.85,
-                    "reasoning": "Name matches well",
-                    "feedback": "Double-check spelling of last name",
-                },
-                {
-                    "score": 0.65,
-                    "reasoning": "Name partially correct",
-                    "feedback": "Extract full legal name from signature block",
-                },
+        mock_judge_scores = JudgeScores(
+            scores=[
+                JudgeScoreItem(
+                    score=0.85,
+                    reasoning="Name matches well",
+                    feedback="Double-check spelling of last name",
+                    findings="ISSUES",
+                ),
+                JudgeScoreItem(
+                    score=0.65,
+                    reasoning="Name partially correct",
+                    feedback="Extract full legal name from signature block",
+                    findings="ISSUES",
+                ),
             ]
         )
 
         with patch.object(judge, "judge") as mock_judge:
             mock_result = MagicMock()
-            mock_result.scores = mock_scores
+            mock_result.scores = mock_judge_scores
             mock_judge.return_value = mock_result
 
             scores = judge.forward("Sample text", sample_candidates)
 
             assert len(scores) == 2
-            assert len(scores[0]) == 3
+            assert len(scores[0]) == 4
             assert scores[0][2] == "Double-check spelling of last name"
             assert scores[1][2] == "Extract full legal name from signature block"
 
     def test_judge_fallback_provides_default_feedback(self, sample_candidates):
-        """Judge should provide default feedback when parsing fails."""
+        """Judge should provide default feedback when call fails."""
         judge = BuiltinJudge(PersonTestSchema)
 
         with patch.object(judge, "judge") as mock_judge:
-            mock_result = MagicMock()
-            mock_result.scores = "invalid json"
-            mock_judge.return_value = mock_result
+            mock_judge.side_effect = Exception("LLM call failed")
 
             scores = judge.forward("Sample text", sample_candidates)
 
             assert len(scores) == 2
-            # Fallback should include feedback
+            # Fallback should include feedback and default ISSUES findings
             assert scores[0][2] == "No feedback available"
             assert scores[1][2] == "No feedback available"
+            assert scores[0][3] == "ISSUES"
+            assert scores[1][3] == "ISSUES"
 
 
 class TestRefinementEngineFeedbackFlow:
@@ -185,10 +193,10 @@ class TestRefinementEngineFeedbackFlow:
 
         engine = RefinementEngine(PersonTestSchema, mock_extractor)
 
-        # Mock the judge to return scores with feedback
+        # Mock the judge to return scores with feedback and findings
         mock_scores = [
-            (0.9, "Good extraction", "Improve source span accuracy"),
-            (0.7, "Partial extraction", "Add missing fields"),
+            (0.9, "Good extraction", "Improve source span accuracy", "ISSUES"),
+            (0.7, "Partial extraction", "Add missing fields", "ISSUES"),
         ]
 
         with patch.object(
@@ -217,10 +225,10 @@ class TestRefinementEngineFeedbackFlow:
 
         engine = RefinementEngine(PersonTestSchema, mock_extractor)
 
-        # Mock scores - candidate 0 has higher score
+        # Mock scores - candidate 0 has higher score, with ISSUES findings
         mock_scores = [
-            (0.9, "Good extraction", "Check name spelling in header"),
-            (0.7, "Partial extraction", "Add missing fields"),
+            (0.9, "Good extraction", "Check name spelling in header", "ISSUES"),
+            (0.7, "Partial extraction", "Add missing fields", "ISSUES"),
         ]
 
         with patch.object(
@@ -259,8 +267,8 @@ class TestRefinementEngineFeedbackFlow:
 
         # Need 2+ candidates for judge to be called
         mock_scores = [
-            (0.9, "Good", "Verify age from birth date"),
-            (0.7, "Partial", "Check name"),
+            (0.9, "Good", "Verify age from birth date", "ISSUES"),
+            (0.7, "Partial", "Check name", "ISSUES"),
         ]
 
         with patch.object(
