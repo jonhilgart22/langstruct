@@ -3,7 +3,7 @@
 from typing import Any, Dict, List, Literal
 
 import dspy
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing_extensions import Annotated
 
 
@@ -14,8 +14,32 @@ class JudgeScoreItem(BaseModel):
     reasoning: str = Field(description="Explanation of the score")
     feedback: str = Field(description="Specific actionable improvements")
     findings: Literal["NO_ISSUES", "ISSUES"] = Field(
-        description="NO_ISSUES if extraction is correct and complete, ISSUES if problems were found"
+        description=(
+            "NO_ISSUES if the extraction is correct and complete (including correctly empty "
+            "extractions when the data doesn't match schema requirements), "
+            "ISSUES if problems were found that need fixing"
+        )
     )
+
+    @field_validator("findings", mode="before")
+    @classmethod
+    def normalize_findings(cls, v: Any) -> str:
+        """Normalize LLM output variations to exact enum values."""
+        if isinstance(v, str):
+            normalized = v.strip().upper().replace(" ", "_").replace("-", "_")
+            if normalized in (
+                "NO_ISSUES",
+                "NOISSUES",
+                "NO_ISSUE",
+                "NONE",
+                "FINISHED_GENERATION",
+                "FINISHED",
+                "COMPLETE",
+                "COMPLETED",
+            ):
+                return "NO_ISSUES"
+            return "ISSUES"
+        return "ISSUES"
 
 
 class JudgeScores(BaseModel):

@@ -1,0 +1,131 @@
+
+
+---
+
+
+
+---
+
+
+
+---
+
+these dont belong here and should be pakcer_ prefix in retrieval config to be used in packer 
+
+move to retrieval config top_n_chunks_per_query_excel: int = Field(
+        default=40,
+        ge=1,
+        le=200,
+        description="Max chunks to keep per search query when >=excel_chunk_ratio_threshold of chunks are Excel.",
+    )
+    excel_chunk_ratio_threshold: float = Field(
+        default=0.8,
+        ge=0.0,
+        le=1.0,
+        description="Fraction of chunks that must be Excel to trigger top_n_chunks_per_query_excel limit.",
+    )
+
+---
+
+we actually dont need these things are goverened by token budgets, you can remove everywhere
+
+---
+
+why doesn valuation summary sheet score so low here 
+
+guments: 
+(as Python)
+{
+5 items
+'logfire.logger_name': 'pacific.deps.logs.logs',
+'num_sheets': 50,
+'query': 'What is projected_noi for 1221 Brickell?',
+'query_rewrites'
+: 
+[
+'Projected net operating income (NOI) for the property at 1221 Brickell, including forecasts and esti...',
+'Forecasted net operating income (NOI) and associated financial projections for the 1221 Brickell pro...',
+],
+'sheet_scores'
+: 
+[
+50 items
+{
+6 items
+'sheet_name': 'Hist. Op Statements',
+'mean_top_n_score': 98.1578,
+'max_score': 110.8997,
+'chunk_count': 12,
+'top_n_chunk_count': 9,
+'composite_score': 0.8537,
+},
+{
+6 items
+'sheet_name': 'Net Proceeds & NBA',
+'mean_top_n_score': 98.4883,
+'max_score': 106.3391,
+'chunk_count': 69,
+'top_n_chunk_count': 43,
+'composite_score': 0.8275,
+},
+{
+6 items
+'sheet_name': 'Hist. OpEx-EOP',
+'mean_top_n_score': 94.7481,
+'max_score': 104.9353,
+'chunk_count': 30,
+'top_n_chunk_count': 14,
+'composite_score': 0.7608,
+},
+{
+6 items
+'sheet_name': 'RENT ROLL1',
+'mean_top_n_score': 90.3313,
+'max_score': 91.7546,
+'chunk_count': 50,
+'top_n_chunk_count': 29,
+'composite_score': 0.7603,
+},
+{
+6 items
+'sheet_name': 'Deal Metrics',
+'mean_top_n_score': 96.4732,
+'max_score': 130.8734,
+'chunk_count': 17,
+'top_n_chunk_count': 7,
+'composite_score': 0.758,
+},
+{
+6 items
+'sheet_name': 'NB IRR',
+'mean_top_n_score': 102.5817,
+'max_score': 117.7978,
+'chunk_count': 670,
+'top_n_chunk_count': 58,
+'composite_score': 0.7559,
+},{
+6 items
+'sheet_name': 'Valuation Summary',
+'mean_top_n_score': 90.3006,
+'max_score': 97.7523,
+'chunk_count': 151,
+'top_n_chunk_count': 11,
+'composite_score': 0.6392,
+},logfire.logger_name': 'pacific.deps.logs.logs',
+'num_sheets': 50,
+'query': 'What is projected_noi for 1221 Brickell?',
+'query_rewrites'
+: 
+[
+'Projected net operating income (NOI) for the property at 1221 Brickell, including forecasts and esti...',
+'Forecasted net operating income (NOI) and associated financial projections for the 1221 Brickell pro...',
+],
+'sheet_scores' it's probably the best sheet to pull from (you have access to the file local land in docetl test_data)
+
+---
+
+i merged in a new pr to my main lagnstruct , force update uvsync
+
+---
+
+can you verify the code has been updated in the venv file
