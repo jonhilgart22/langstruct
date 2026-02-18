@@ -18,6 +18,7 @@ from langstruct.core.refinement import (
     RefinementTrace,
 )
 from langstruct.core.schemas import ExtractionResult, SourceSpan
+from langstruct.core.signatures import JudgeScoreItem, JudgeScores
 
 
 class PersonTestSchema(BaseModel):
@@ -88,28 +89,30 @@ class TestJudgeFeedbackReturn:
     """Test that judges return feedback in their tuples."""
 
     def test_builtin_judge_returns_feedback_tuple(self, sample_candidates):
-        """BuiltinJudge should return (score, reasoning, feedback) tuples."""
+        """BuiltinJudge should return (score, reasoning, feedback, findings) tuples."""
         judge = BuiltinJudge(PersonTestSchema)
 
-        # Mock the DSPy judge call
-        mock_scores = json.dumps(
-            [
-                {
-                    "score": 0.9,
-                    "reasoning": "Good extraction with accurate values",
-                    "feedback": "Consider adding source span for middle name",
-                },
-                {
-                    "score": 0.7,
-                    "reasoning": "Missing some details",
-                    "feedback": "Verify age against document header",
-                },
+        # Mock the DSPy judge call with structured JudgeScores output
+        mock_judge_scores = JudgeScores(
+            scores=[
+                JudgeScoreItem(
+                    score=0.9,
+                    reasoning="Good extraction with accurate values",
+                    feedback="Consider adding source span for middle name",
+                    findings="ISSUES",
+                ),
+                JudgeScoreItem(
+                    score=0.7,
+                    reasoning="Missing some details",
+                    feedback="Verify age against document header",
+                    findings="ISSUES",
+                ),
             ]
         )
 
         with patch.object(judge, "judge") as mock_judge:
             mock_result = MagicMock()
-            mock_result.scores = mock_scores
+            mock_result.scores = mock_judge_scores
             mock_judge.return_value = mock_result
 
             scores = judge.forward(
@@ -117,61 +120,66 @@ class TestJudgeFeedbackReturn:
             )
 
             assert len(scores) == 2
-            # Each score should be a 3-tuple: (score, reasoning, feedback)
-            assert len(scores[0]) == 3
-            assert len(scores[1]) == 3
+            # Each score should be a 4-tuple: (score, reasoning, feedback, findings)
+            assert len(scores[0]) == 4
+            assert len(scores[1]) == 4
 
             # Verify feedback is extracted
             assert scores[0][2] == "Consider adding source span for middle name"
             assert scores[1][2] == "Verify age against document header"
+            # Verify findings
+            assert scores[0][3] == "ISSUES"
+            assert scores[1][3] == "ISSUES"
 
     def test_custom_judge_returns_feedback_tuple(self, sample_candidates):
-        """CustomJudge should return (score, reasoning, feedback) tuples."""
+        """CustomJudge should return (score, reasoning, feedback, findings) tuples."""
         custom_rubric = "Focus on name accuracy"
         judge = CustomJudge(PersonTestSchema, custom_rubric)
 
-        mock_scores = json.dumps(
-            [
-                {
-                    "score": 0.85,
-                    "reasoning": "Name matches well",
-                    "feedback": "Double-check spelling of last name",
-                },
-                {
-                    "score": 0.65,
-                    "reasoning": "Name partially correct",
-                    "feedback": "Extract full legal name from signature block",
-                },
+        mock_judge_scores = JudgeScores(
+            scores=[
+                JudgeScoreItem(
+                    score=0.85,
+                    reasoning="Name matches well",
+                    feedback="Double-check spelling of last name",
+                    findings="ISSUES",
+                ),
+                JudgeScoreItem(
+                    score=0.65,
+                    reasoning="Name partially correct",
+                    feedback="Extract full legal name from signature block",
+                    findings="ISSUES",
+                ),
             ]
         )
 
         with patch.object(judge, "judge") as mock_judge:
             mock_result = MagicMock()
-            mock_result.scores = mock_scores
+            mock_result.scores = mock_judge_scores
             mock_judge.return_value = mock_result
 
             scores = judge.forward("Sample text", sample_candidates)
 
             assert len(scores) == 2
-            assert len(scores[0]) == 3
+            assert len(scores[0]) == 4
             assert scores[0][2] == "Double-check spelling of last name"
             assert scores[1][2] == "Extract full legal name from signature block"
 
     def test_judge_fallback_provides_default_feedback(self, sample_candidates):
-        """Judge should provide default feedback when parsing fails."""
+        """Judge should provide default feedback when call fails."""
         judge = BuiltinJudge(PersonTestSchema)
 
         with patch.object(judge, "judge") as mock_judge:
-            mock_result = MagicMock()
-            mock_result.scores = "invalid json"
-            mock_judge.return_value = mock_result
+            mock_judge.side_effect = Exception("LLM call failed")
 
             scores = judge.forward("Sample text", sample_candidates)
 
             assert len(scores) == 2
-            # Fallback should include feedback
+            # Fallback should include feedback and default ISSUES findings
             assert scores[0][2] == "No feedback available"
             assert scores[1][2] == "No feedback available"
+            assert scores[0][3] == "ISSUES"
+            assert scores[1][3] == "ISSUES"
 
 
 class TestRefinementEngineFeedbackFlow:
@@ -185,10 +193,10 @@ class TestRefinementEngineFeedbackFlow:
 
         engine = RefinementEngine(PersonTestSchema, mock_extractor)
 
-        # Mock the judge to return scores with feedback
+        # Mock the judge to return scores with feedback and findings
         mock_scores = [
-            (0.9, "Good extraction", "Improve source span accuracy"),
-            (0.7, "Partial extraction", "Add missing fields"),
+            (0.9, "Good extraction", "Improve source span accuracy", "ISSUES"),
+            (0.7, "Partial extraction", "Add missing fields", "ISSUES"),
         ]
 
         with patch.object(
@@ -217,10 +225,10 @@ class TestRefinementEngineFeedbackFlow:
 
         engine = RefinementEngine(PersonTestSchema, mock_extractor)
 
-        # Mock scores - candidate 0 has higher score
+        # Mock scores - candidate 0 has higher score, with ISSUES findings
         mock_scores = [
-            (0.9, "Good extraction", "Check name spelling in header"),
-            (0.7, "Partial extraction", "Add missing fields"),
+            (0.9, "Good extraction", "Check name spelling in header", "ISSUES"),
+            (0.7, "Partial extraction", "Add missing fields", "ISSUES"),
         ]
 
         with patch.object(
@@ -259,8 +267,8 @@ class TestRefinementEngineFeedbackFlow:
 
         # Need 2+ candidates for judge to be called
         mock_scores = [
-            (0.9, "Good", "Verify age from birth date"),
-            (0.7, "Partial", "Check name"),
+            (0.9, "Good", "Verify age from birth date", "ISSUES"),
+            (0.7, "Partial", "Check name", "ISSUES"),
         ]
 
         with patch.object(
@@ -440,85 +448,149 @@ class TestParseRetryWithFeedback:
             assert mock_refine.call_count == 1
             assert "parse_retries" not in result.metadata
 
-    def test_builtin_judge_retries_on_json_parse_failure(self, sample_candidates):
-        """BuiltinJudge should retry with error feedback on parse failure."""
+    def test_builtin_judge_fallback_on_exception(self, sample_candidates):
+        """BuiltinJudge should return fallback scores when judge call raises."""
         judge = BuiltinJudge(PersonTestSchema)
 
-        call_count = 0
+        with patch.object(judge, "judge") as mock_judge:
+            mock_judge.side_effect = Exception("LLM error")
 
-        def mock_judge_side_effect(**kwargs):
-            nonlocal call_count
-            call_count += 1
-            mock_result = MagicMock()
-            if call_count == 1:
-                mock_result.scores = "invalid json"
-            else:
-                mock_result.scores = json.dumps(
-                    [
-                        {"score": 0.9, "reasoning": "Good", "feedback": "OK"},
-                        {"score": 0.7, "reasoning": "Fine", "feedback": "OK"},
-                    ]
-                )
-            return mock_result
-
-        with patch.object(judge, "judge", side_effect=mock_judge_side_effect):
             scores = judge.forward("Sample text", sample_candidates)
 
-            assert call_count == 2
             assert len(scores) == 2
-            assert scores[0][0] == 0.9
+            assert scores[0][0] == 0.5
+            assert scores[0][3] == "ISSUES"
 
-    def test_builtin_judge_includes_error_in_rubric_on_retry(self, sample_candidates):
-        """BuiltinJudge should include parse error in rubric for retry."""
-        judge = BuiltinJudge(PersonTestSchema)
-
-        captured_rubrics = []
-
-        def mock_judge_side_effect(**kwargs):
-            captured_rubrics.append(kwargs.get("rubric", ""))
-            mock_result = MagicMock()
-            if len(captured_rubrics) == 1:
-                mock_result.scores = "not json"
-            else:
-                mock_result.scores = json.dumps(
-                    [
-                        {"score": 0.9, "reasoning": "Good", "feedback": "OK"},
-                        {"score": 0.7, "reasoning": "Fine", "feedback": "OK"},
-                    ]
-                )
-            return mock_result
-
-        with patch.object(judge, "judge", side_effect=mock_judge_side_effect):
-            judge.forward("Sample text", sample_candidates)
-
-            assert len(captured_rubrics) == 2
-            assert "CRITICAL" in captured_rubrics[1]
-            assert "not valid JSON" in captured_rubrics[1]
-
-    def test_custom_judge_retries_on_json_parse_failure(self, sample_candidates):
-        """CustomJudge should retry with error feedback on parse failure."""
+    def test_custom_judge_fallback_on_exception(self, sample_candidates):
+        """CustomJudge should return fallback scores when judge call raises."""
         judge = CustomJudge(PersonTestSchema, "Custom rubric")
 
-        call_count = 0
+        with patch.object(judge, "judge") as mock_judge:
+            mock_judge.side_effect = Exception("LLM error")
 
-        def mock_judge_side_effect(**kwargs):
-            nonlocal call_count
-            call_count += 1
-            mock_result = MagicMock()
-            if call_count == 1:
-                mock_result.scores = "invalid json"
-            else:
-                mock_result.scores = json.dumps(
-                    [
-                        {"score": 0.85, "reasoning": "Good", "feedback": "OK"},
-                        {"score": 0.65, "reasoning": "Fine", "feedback": "OK"},
-                    ]
-                )
-            return mock_result
-
-        with patch.object(judge, "judge", side_effect=mock_judge_side_effect):
             scores = judge.forward("Sample text", sample_candidates)
 
-            assert call_count == 2
             assert len(scores) == 2
-            assert scores[0][0] == 0.85
+            assert scores[0][0] == 0.5
+            assert scores[0][3] == "ISSUES"
+
+
+class TestFindingsSkipRefinement:
+    """Test that NO_ISSUES findings skip refinement and ISSUES proceeds."""
+
+    def test_no_issues_skips_refinement(self, sample_candidates):
+        """When judge returns NO_ISSUES, refiner should NOT be called."""
+        mock_extractor = MagicMock()
+        mock_extractor.return_value = sample_candidates[0]
+
+        engine = RefinementEngine(PersonTestSchema, mock_extractor)
+
+        # Judge says NO_ISSUES for the best candidate
+        mock_scores = [
+            (0.95, "Perfect extraction", "No improvements needed", "NO_ISSUES"),
+            (0.7, "Partial extraction", "Add missing fields", "ISSUES"),
+        ]
+
+        with patch.object(
+            engine, "_generate_candidates", return_value=sample_candidates
+        ):
+            with patch.object(
+                engine.builtin_judge, "forward", return_value=mock_scores
+            ):
+                with patch.object(engine.refiner, "forward") as mock_refiner:
+                    config = Refine(
+                        strategy=RefinementStrategy.BON_THEN_REFINE,
+                        n_candidates=2,
+                        max_refine_steps=1,
+                    )
+
+                    result, trace = engine.forward("Sample text", config)
+
+                    # Refiner should NOT have been called
+                    mock_refiner.assert_not_called()
+                    # Should return the best candidate directly
+                    assert result == sample_candidates[0]
+                    # No refine diffs should exist
+                    assert len(trace.refine_diffs) == 0
+
+    def test_issues_proceeds_with_refinement(self, sample_candidates):
+        """When judge returns ISSUES, refiner should be called."""
+        mock_extractor = MagicMock()
+        mock_extractor.return_value = sample_candidates[0]
+
+        engine = RefinementEngine(PersonTestSchema, mock_extractor)
+
+        # Judge says ISSUES for the best candidate
+        mock_scores = [
+            (0.9, "Good extraction", "Fix the age field", "ISSUES"),
+            (0.7, "Partial extraction", "Add missing fields", "ISSUES"),
+        ]
+
+        with patch.object(
+            engine, "_generate_candidates", return_value=sample_candidates
+        ):
+            with patch.object(
+                engine.builtin_judge, "forward", return_value=mock_scores
+            ):
+                with patch.object(engine.refiner, "forward") as mock_refiner:
+                    mock_refiner.return_value = sample_candidates[0]
+
+                    config = Refine(
+                        strategy=RefinementStrategy.BON_THEN_REFINE,
+                        n_candidates=2,
+                        max_refine_steps=1,
+                    )
+
+                    result, trace = engine.forward("Sample text", config)
+
+                    # Refiner SHOULD have been called
+                    mock_refiner.assert_called_once()
+
+    def test_findings_stored_in_trace(self, sample_candidates):
+        """Findings should be stored in trace.candidates."""
+        mock_extractor = MagicMock()
+        mock_extractor.return_value = sample_candidates[0]
+
+        engine = RefinementEngine(PersonTestSchema, mock_extractor)
+
+        mock_scores = [
+            (0.95, "Perfect", "No issues", "NO_ISSUES"),
+            (0.7, "Partial", "Fix name", "ISSUES"),
+        ]
+
+        with patch.object(
+            engine, "_generate_candidates", return_value=sample_candidates
+        ):
+            with patch.object(
+                engine.builtin_judge, "forward", return_value=mock_scores
+            ):
+                config = Refine(
+                    strategy=RefinementStrategy.BON,
+                    n_candidates=2,
+                    max_refine_steps=1,
+                )
+
+                result, trace = engine.forward("Sample text", config)
+
+                assert len(trace.candidates) == 2
+                assert trace.candidates[0].findings == "NO_ISSUES"
+                assert trace.candidates[1].findings == "ISSUES"
+
+    def test_single_candidate_defaults_to_issues(self, sample_candidates):
+        """Single candidate path should default findings to ISSUES."""
+        mock_extractor = MagicMock()
+        mock_extractor.return_value = sample_candidates[0]
+
+        engine = RefinementEngine(PersonTestSchema, mock_extractor)
+
+        config = Refine(
+            strategy=RefinementStrategy.REFINE,
+            n_candidates=1,
+            max_refine_steps=1,
+        )
+
+        with patch.object(engine.refiner, "forward", return_value=sample_candidates[0]):
+            result, trace = engine.forward("Sample text", config)
+
+            assert len(trace.candidates) == 1
+            assert trace.candidates[0].findings == "ISSUES"

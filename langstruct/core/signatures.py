@@ -1,9 +1,27 @@
 """DSPy signatures for structured extraction tasks."""
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Literal
 
 import dspy
+from pydantic import BaseModel, Field
 from typing_extensions import Annotated
+
+
+class JudgeScoreItem(BaseModel):
+    """Score for a single extraction candidate."""
+
+    score: float = Field(ge=0.0, le=1.0, description="Score between 0 and 1")
+    reasoning: str = Field(description="Explanation of the score")
+    feedback: str = Field(description="Specific actionable improvements")
+    findings: Literal["NO_ISSUES", "ISSUES"] = Field(
+        description="NO_ISSUES if extraction is correct and complete, ISSUES if problems were found"
+    )
+
+
+class JudgeScores(BaseModel):
+    """Judgment results for multiple candidates."""
+
+    scores: List[JudgeScoreItem] = Field(description="Score for each candidate")
 
 
 class ExtractEntities(dspy.Signature):
@@ -140,6 +158,10 @@ class JudgeExtractions(dspy.Signature):
     Evaluate extraction candidates against a rubric and provide scores,
     reasoning, and actionable feedback. Focus on faithfulness to source text,
     completeness, and accuracy of extracted information.
+
+    For each candidate, set findings to NO_ISSUES if the extraction is correct
+    and complete with no problems found, or ISSUES if there are problems that
+    need fixing.
     """
 
     text: Annotated[str, dspy.InputField(desc="Original source text")]
@@ -150,8 +172,8 @@ class JudgeExtractions(dspy.Signature):
     schema_spec: Annotated[str, dspy.InputField(desc="Expected schema specification")]
     rubric: Annotated[str, dspy.InputField(desc="Scoring rubric and criteria")]
     scores: Annotated[
-        str,
+        JudgeScores,
         dspy.OutputField(
-            desc="JSON array with score (0-1), reasoning, and feedback for each candidate. Each item must have: score (float 0-1), reasoning (string explaining the score), feedback (string with specific actionable improvements for the next generation)"
+            desc="Structured judgment with scores, feedback, and findings for each candidate"
         ),
     ]
