@@ -209,9 +209,13 @@ class BuiltinJudge(dspy.Module):
             "2. Completeness: All required fields should be filled when data is available\n"
             "3. Source quality: Source spans should contain the complete extracted values\n"
             "4. No hallucination: Never extract values not present in the original text\n"
+            "5. Schema compliance: Respect schema exclusions and constraints — an empty extraction "
+            "is correct when the source data does not match schema requirements\n"
             "Prefer candidates that exactly quote from the text over those that paraphrase.\n\n"
             "For each candidate, provide specific actionable feedback on how to improve the extraction.\n"
-            "Set findings to NO_ISSUES if the extraction is correct and complete, or ISSUES if problems were found."
+            "Set findings to NO_ISSUES if the extraction is correct and complete "
+            "(including correctly empty results when data doesn't match schema requirements), "
+            "or ISSUES if there are actual problems that need fixing."
         )
 
         try:
@@ -284,7 +288,9 @@ class CustomJudge(dspy.Module):
         rubric_with_feedback = (
             f"{self.rubric}\n\n"
             "For each candidate, provide specific actionable feedback on how to improve the extraction.\n"
-            "Set findings to NO_ISSUES if the extraction is correct and complete, or ISSUES if problems were found."
+            "Set findings to NO_ISSUES if the extraction is correct and complete "
+            "(including correctly empty results when data doesn't match schema requirements), "
+            "or ISSUES if there are actual problems that need fixing."
         )
 
         try:
@@ -551,7 +557,16 @@ class RefinementEngine(dspy.Module):
             calls_used += 1
 
         # Step 2: Judge candidates and select best
-        if len(candidates) > 1:
+        # Always run the judge when the strategy includes refinement (even for
+        # a single candidate) so that NO_ISSUES findings can skip the expensive
+        # refiner call.  For BON-only with a single candidate, skip judging
+        # since there is nothing to compare and no refinement to gate.
+        run_judge = len(candidates) > 1 or refine_config.strategy in [
+            RefinementStrategy.REFINE,
+            RefinementStrategy.BON_THEN_REFINE,
+        ]
+
+        if run_judge:
             logger.info(
                 "RefinementEngine judging candidates count=%d custom_judge=%s",
                 len(candidates),
@@ -561,8 +576,9 @@ class RefinementEngine(dspy.Module):
             scores = judge(text, candidates)
             calls_used += 1  # Judge call
             logger.info(
-                "RefinementEngine judging complete scores=%s calls_used=%d",
+                "RefinementEngine judging complete scores=%s findings=%s calls_used=%d",
                 [round(s[0], 3) for s in scores],
+                [s[3] for s in scores],
                 calls_used,
             )
 
@@ -590,12 +606,12 @@ class RefinementEngine(dspy.Module):
         else:
             best_candidate = candidates[0]
             best_feedback = "General quality improvement needed"
-            best_findings = "ISSUES"  # Default to ISSUES for single candidate
+            best_findings = "ISSUES"
             trace.candidates.append(
                 CandidateResult(
                     extraction=best_candidate,
                     score=best_candidate.confidence,
-                    reasoning="Single candidate",
+                    reasoning="Single candidate (no judge)",
                     feedback=best_feedback,
                     findings=best_findings,
                     candidate_id=0,
@@ -619,7 +635,7 @@ class RefinementEngine(dspy.Module):
             logger.info(
                 "RefinementEngine starting refinement steps max_steps=%d feedback=%s",
                 refine_config.max_refine_steps,
-                best_feedback[:100] if best_feedback else None,
+                best_feedback[:200] if best_feedback else None,
             )
             current_result = best_candidate
             current_feedback = best_feedback

@@ -58,6 +58,42 @@ def sample_candidates(sample_extraction):
     return [candidate1, candidate2]
 
 
+class TestFindingsNormalization:
+    """Test that the findings field validator normalizes LLM output variations."""
+
+    @pytest.mark.parametrize(
+        "raw_value,expected",
+        [
+            ("NO_ISSUES", "NO_ISSUES"),
+            ("ISSUES", "ISSUES"),
+            ("no_issues", "NO_ISSUES"),
+            ("No Issues", "NO_ISSUES"),
+            ("no-issues", "NO_ISSUES"),
+            ("No_Issues", "NO_ISSUES"),
+            ("  NO_ISSUES  ", "NO_ISSUES"),
+            ("noissues", "NO_ISSUES"),
+            ("none", "NO_ISSUES"),
+            ("FINISHED_GENERATION", "NO_ISSUES"),
+            ("finished_generation", "NO_ISSUES"),
+            ("FINISHED", "NO_ISSUES"),
+            ("COMPLETE", "NO_ISSUES"),
+            ("COMPLETED", "NO_ISSUES"),
+            ("issues", "ISSUES"),
+            ("Issues", "ISSUES"),
+            ("some problems found", "ISSUES"),
+        ],
+    )
+    def test_findings_normalizes_variants(self, raw_value, expected):
+        """JudgeScoreItem should normalize common LLM output variations."""
+        item = JudgeScoreItem(
+            score=0.9,
+            reasoning="Test",
+            feedback="Test",
+            findings=raw_value,
+        )
+        assert item.findings == expected
+
+
 class TestCandidateResultFeedback:
     """Test that CandidateResult properly stores feedback."""
 
@@ -300,25 +336,34 @@ class TestRefinementEngineFeedbackFlow:
                             == "Verify age from birth date"
                         )
 
-    def test_single_candidate_gets_default_feedback(self, sample_candidates):
-        """Single candidate (no judging) should get default feedback."""
+    def test_single_candidate_refine_strategy_runs_judge(self, sample_candidates):
+        """Single candidate with REFINE strategy should still run the judge."""
         mock_extractor = MagicMock()
         mock_extractor.return_value = sample_candidates[0]
 
         engine = RefinementEngine(PersonTestSchema, mock_extractor)
 
+        # Judge returns ISSUES for the single candidate
+        mock_scores = [
+            (0.8, "Good but could improve", "Check age field", "ISSUES"),
+        ]
+
         config = Refine(
             strategy=RefinementStrategy.REFINE,  # No BON, just refine
             n_candidates=1,
-            max_refine_steps=1,  # Must be >= 1
+            max_refine_steps=1,
         )
 
-        with patch.object(engine.refiner, "forward", return_value=sample_candidates[0]):
-            result, trace = engine.forward("Sample text", config)
+        with patch.object(engine.builtin_judge, "forward", return_value=mock_scores):
+            with patch.object(
+                engine.refiner, "forward", return_value=sample_candidates[0]
+            ):
+                result, trace = engine.forward("Sample text", config)
 
-            # Single candidate should have default feedback
-            assert len(trace.candidates) == 1
-            assert trace.candidates[0].feedback == "General quality improvement needed"
+                # Judge should have been called even for single candidate
+                assert len(trace.candidates) == 1
+                assert trace.candidates[0].feedback == "Check age field"
+                assert trace.candidates[0].findings == "ISSUES"
 
 
 class TestExtractionRefinerReceivesFeedback:
@@ -576,8 +621,177 @@ class TestFindingsSkipRefinement:
                 assert trace.candidates[0].findings == "NO_ISSUES"
                 assert trace.candidates[1].findings == "ISSUES"
 
-    def test_single_candidate_defaults_to_issues(self, sample_candidates):
-        """Single candidate path should default findings to ISSUES."""
+    def test_single_candidate_no_issues_skips_refinement(self, sample_candidates):
+        """Single candidate with NO_ISSUES should skip refinement."""
+        mock_extractor = MagicMock()
+        mock_extractor.return_value = sample_candidates[0]
+
+        engine = RefinementEngine(PersonTestSchema, mock_extractor)
+
+        # Judge returns NO_ISSUES for the single candidate
+        mock_scores = [
+            (0.95, "Perfect extraction", "No improvements needed", "NO_ISSUES"),
+        ]
+
+        config = Refine(
+            strategy=RefinementStrategy.REFINE,
+            n_candidates=1,
+            max_refine_steps=1,
+        )
+
+        with patch.object(engine.builtin_judge, "forward", return_value=mock_scores):
+            with patch.object(engine.refiner, "forward") as mock_refiner:
+                result, trace = engine.forward("Sample text", config)
+
+                # Refiner should NOT have been called
+                mock_refiner.assert_not_called()
+                assert len(trace.candidates) == 1
+                assert trace.candidates[0].findings == "NO_ISSUES"
+                assert len(trace.refine_diffs) == 0
+
+
+class TestJudgeAlwaysRunsBeforeRefinement:
+    """Test that the judge runs for all strategies that include refinement,
+    even with a single candidate, so NO_ISSUES can gate the refiner."""
+
+    def test_refine_strategy_single_candidate_runs_judge(self, sample_candidates):
+        """REFINE strategy with 1 candidate should still call the judge."""
+        mock_extractor = MagicMock()
+        mock_extractor.return_value = sample_candidates[0]
+
+        engine = RefinementEngine(PersonTestSchema, mock_extractor)
+
+        mock_scores = [
+            (0.85, "Good extraction", "Minor improvements", "ISSUES"),
+        ]
+
+        config = Refine(
+            strategy=RefinementStrategy.REFINE,
+            n_candidates=1,
+            max_refine_steps=1,
+        )
+
+        with patch.object(
+            engine.builtin_judge, "forward", return_value=mock_scores
+        ) as mock_judge_forward:
+            with patch.object(
+                engine.refiner, "forward", return_value=sample_candidates[0]
+            ):
+                result, trace = engine.forward("Sample text", config)
+
+                # Judge MUST have been called
+                mock_judge_forward.assert_called_once()
+                assert trace.candidates[0].score == 0.85
+                assert trace.candidates[0].feedback == "Minor improvements"
+
+    def test_bon_then_refine_single_candidate_runs_judge(self, sample_candidates):
+        """BON_THEN_REFINE with 1 candidate should still call the judge."""
+        mock_extractor = MagicMock()
+        mock_extractor.return_value = sample_candidates[0]
+
+        engine = RefinementEngine(PersonTestSchema, mock_extractor)
+
+        mock_scores = [
+            (0.9, "Solid extraction", "Check dates", "ISSUES"),
+        ]
+
+        config = Refine(
+            strategy=RefinementStrategy.BON_THEN_REFINE,
+            n_candidates=1,
+            max_refine_steps=1,
+        )
+
+        with patch.object(
+            engine.builtin_judge, "forward", return_value=mock_scores
+        ) as mock_judge_forward:
+            with patch.object(
+                engine.refiner, "forward", return_value=sample_candidates[0]
+            ):
+                result, trace = engine.forward("Sample text", config)
+
+                mock_judge_forward.assert_called_once()
+
+    def test_bon_only_single_candidate_skips_judge(self, sample_candidates):
+        """BON strategy with 1 candidate should NOT call the judge (no refinement to gate)."""
+        mock_extractor = MagicMock()
+        mock_extractor.return_value = sample_candidates[0]
+
+        engine = RefinementEngine(PersonTestSchema, mock_extractor)
+
+        config = Refine(
+            strategy=RefinementStrategy.BON,
+            n_candidates=1,
+            max_refine_steps=1,
+        )
+
+        with patch.object(engine.builtin_judge, "forward") as mock_judge_forward:
+            result, trace = engine.forward("Sample text", config)
+
+            # Judge should NOT be called — BON-only with 1 candidate has no use for it
+            mock_judge_forward.assert_not_called()
+            assert trace.candidates[0].reasoning == "Single candidate (no judge)"
+
+    def test_single_candidate_judge_no_issues_saves_refiner_call(
+        self, sample_candidates
+    ):
+        """When judge says NO_ISSUES for a single candidate, refiner is never invoked."""
+        mock_extractor = MagicMock()
+        mock_extractor.return_value = sample_candidates[0]
+
+        engine = RefinementEngine(PersonTestSchema, mock_extractor)
+
+        mock_scores = [
+            (0.98, "Perfect — no changes needed", "None", "NO_ISSUES"),
+        ]
+
+        config = Refine(
+            strategy=RefinementStrategy.REFINE,
+            n_candidates=1,
+            max_refine_steps=3,  # Would do 3 steps if ISSUES
+        )
+
+        with patch.object(engine.builtin_judge, "forward", return_value=mock_scores):
+            with patch.object(engine.refiner, "forward") as mock_refiner:
+                result, trace = engine.forward("Sample text", config)
+
+                mock_refiner.assert_not_called()
+                assert result == sample_candidates[0]
+                assert trace.candidates[0].findings == "NO_ISSUES"
+                # Budget should reflect judge call but no refiner calls
+                assert trace.budget_used["calls"] == 2  # 1 extract + 1 judge
+
+    def test_single_candidate_judge_issues_proceeds_to_refine(self, sample_candidates):
+        """When judge says ISSUES for a single candidate, refiner should be called."""
+        mock_extractor = MagicMock()
+        mock_extractor.return_value = sample_candidates[0]
+
+        engine = RefinementEngine(PersonTestSchema, mock_extractor)
+
+        mock_scores = [
+            (0.7, "Missing fields", "Add the age field", "ISSUES"),
+        ]
+
+        config = Refine(
+            strategy=RefinementStrategy.REFINE,
+            n_candidates=1,
+            max_refine_steps=1,
+        )
+
+        with patch.object(engine.builtin_judge, "forward", return_value=mock_scores):
+            with patch.object(engine.refiner, "forward") as mock_refiner:
+                mock_refiner.return_value = sample_candidates[0]
+
+                result, trace = engine.forward("Sample text", config)
+
+                mock_refiner.assert_called_once()
+                # Refiner should receive the judge's feedback
+                call_args = mock_refiner.call_args
+                assert call_args.kwargs.get("issues") == "Add the age field"
+
+    def test_judge_fallback_defaults_to_issues_proceeds_to_refine(
+        self, sample_candidates
+    ):
+        """When judge call fails (fallback), findings default to ISSUES and refiner runs."""
         mock_extractor = MagicMock()
         mock_extractor.return_value = sample_candidates[0]
 
@@ -589,8 +803,82 @@ class TestFindingsSkipRefinement:
             max_refine_steps=1,
         )
 
-        with patch.object(engine.refiner, "forward", return_value=sample_candidates[0]):
-            result, trace = engine.forward("Sample text", config)
+        # Make the judge's inner DSPy call fail — fallback returns ISSUES
+        with patch.object(engine.builtin_judge, "judge") as mock_dspy_judge:
+            mock_dspy_judge.side_effect = Exception("LLM error")
 
-            assert len(trace.candidates) == 1
-            assert trace.candidates[0].findings == "ISSUES"
+            with patch.object(engine.refiner, "forward") as mock_refiner:
+                mock_refiner.return_value = sample_candidates[0]
+
+                result, trace = engine.forward("Sample text", config)
+
+                # Fallback should have given ISSUES, so refiner runs
+                mock_refiner.assert_called_once()
+                assert trace.candidates[0].findings == "ISSUES"
+
+    def test_empty_extraction_no_issues_skips_refinement(self, sample_candidates):
+        """Empty extraction judged as NO_ISSUES should skip refinement."""
+        empty_extraction = ExtractionResult(
+            entities={"metrics": []},
+            sources={},
+            confidence=0.9,
+            metadata={},
+        )
+        mock_extractor = MagicMock()
+        mock_extractor.return_value = empty_extraction
+
+        engine = RefinementEngine(PersonTestSchema, mock_extractor)
+
+        # Judge recognises the empty result is correct per schema exclusions
+        mock_scores = [
+            (
+                1.0,
+                "Empty extraction is correct — data doesn't match schema requirements",
+                "No improvements needed",
+                "NO_ISSUES",
+            ),
+        ]
+
+        config = Refine(
+            strategy=RefinementStrategy.REFINE,
+            n_candidates=1,
+            max_refine_steps=1,
+        )
+
+        with patch.object(engine.builtin_judge, "forward", return_value=mock_scores):
+            with patch.object(engine.refiner, "forward") as mock_refiner:
+                result, trace = engine.forward("Sample text", config)
+
+                mock_refiner.assert_not_called()
+                assert result.entities == {"metrics": []}
+                assert trace.candidates[0].findings == "NO_ISSUES"
+
+    def test_custom_judge_no_issues_skips_refinement(self, sample_candidates):
+        """Custom judge returning NO_ISSUES should also skip refinement."""
+        mock_extractor = MagicMock()
+        mock_extractor.return_value = sample_candidates[0]
+
+        engine = RefinementEngine(PersonTestSchema, mock_extractor)
+
+        mock_scores = [
+            (0.95, "Meets custom criteria", "No improvements", "NO_ISSUES"),
+        ]
+
+        config = Refine(
+            strategy=RefinementStrategy.BON_THEN_REFINE,
+            n_candidates=1,
+            judge="Custom rubric: prefer exact dollar amounts",
+            max_refine_steps=2,
+        )
+
+        # Need to patch the _get_judge path for custom rubric
+        with patch.object(engine, "_get_judge") as mock_get_judge:
+            mock_custom = MagicMock()
+            mock_custom.return_value = mock_scores
+            mock_get_judge.return_value = mock_custom
+
+            with patch.object(engine.refiner, "forward") as mock_refiner:
+                result, trace = engine.forward("Sample text", config)
+
+                mock_refiner.assert_not_called()
+                assert trace.candidates[0].findings == "NO_ISSUES"
