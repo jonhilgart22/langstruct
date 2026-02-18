@@ -1,3 +1,0 @@
-The venv has commit `da9e682` but your local repo is at `42a8141` (2 commits ahead). The reinstall pulled from `main` on GitHub — your latest local commits (`42a8141 tests`, `d4fdc83 allow refinement to continue without regenerating`) haven't been pushed yet, or they're on a branch that isn't `main`.
-
-Did you push those recent commits to `main` on GitHub? If so, run the sync again. If those are local-only, you may want to push first.
