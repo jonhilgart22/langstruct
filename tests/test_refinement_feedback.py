@@ -448,85 +448,149 @@ class TestParseRetryWithFeedback:
             assert mock_refine.call_count == 1
             assert "parse_retries" not in result.metadata
 
-    def test_builtin_judge_retries_on_json_parse_failure(self, sample_candidates):
-        """BuiltinJudge should retry with error feedback on parse failure."""
+    def test_builtin_judge_fallback_on_exception(self, sample_candidates):
+        """BuiltinJudge should return fallback scores when judge call raises."""
         judge = BuiltinJudge(PersonTestSchema)
 
-        call_count = 0
+        with patch.object(judge, "judge") as mock_judge:
+            mock_judge.side_effect = Exception("LLM error")
 
-        def mock_judge_side_effect(**kwargs):
-            nonlocal call_count
-            call_count += 1
-            mock_result = MagicMock()
-            if call_count == 1:
-                mock_result.scores = "invalid json"
-            else:
-                mock_result.scores = json.dumps(
-                    [
-                        {"score": 0.9, "reasoning": "Good", "feedback": "OK"},
-                        {"score": 0.7, "reasoning": "Fine", "feedback": "OK"},
-                    ]
-                )
-            return mock_result
-
-        with patch.object(judge, "judge", side_effect=mock_judge_side_effect):
             scores = judge.forward("Sample text", sample_candidates)
 
-            assert call_count == 2
             assert len(scores) == 2
-            assert scores[0][0] == 0.9
+            assert scores[0][0] == 0.5
+            assert scores[0][3] == "ISSUES"
 
-    def test_builtin_judge_includes_error_in_rubric_on_retry(self, sample_candidates):
-        """BuiltinJudge should include parse error in rubric for retry."""
-        judge = BuiltinJudge(PersonTestSchema)
-
-        captured_rubrics = []
-
-        def mock_judge_side_effect(**kwargs):
-            captured_rubrics.append(kwargs.get("rubric", ""))
-            mock_result = MagicMock()
-            if len(captured_rubrics) == 1:
-                mock_result.scores = "not json"
-            else:
-                mock_result.scores = json.dumps(
-                    [
-                        {"score": 0.9, "reasoning": "Good", "feedback": "OK"},
-                        {"score": 0.7, "reasoning": "Fine", "feedback": "OK"},
-                    ]
-                )
-            return mock_result
-
-        with patch.object(judge, "judge", side_effect=mock_judge_side_effect):
-            judge.forward("Sample text", sample_candidates)
-
-            assert len(captured_rubrics) == 2
-            assert "CRITICAL" in captured_rubrics[1]
-            assert "not valid JSON" in captured_rubrics[1]
-
-    def test_custom_judge_retries_on_json_parse_failure(self, sample_candidates):
-        """CustomJudge should retry with error feedback on parse failure."""
+    def test_custom_judge_fallback_on_exception(self, sample_candidates):
+        """CustomJudge should return fallback scores when judge call raises."""
         judge = CustomJudge(PersonTestSchema, "Custom rubric")
 
-        call_count = 0
+        with patch.object(judge, "judge") as mock_judge:
+            mock_judge.side_effect = Exception("LLM error")
 
-        def mock_judge_side_effect(**kwargs):
-            nonlocal call_count
-            call_count += 1
-            mock_result = MagicMock()
-            if call_count == 1:
-                mock_result.scores = "invalid json"
-            else:
-                mock_result.scores = json.dumps(
-                    [
-                        {"score": 0.85, "reasoning": "Good", "feedback": "OK"},
-                        {"score": 0.65, "reasoning": "Fine", "feedback": "OK"},
-                    ]
-                )
-            return mock_result
-
-        with patch.object(judge, "judge", side_effect=mock_judge_side_effect):
             scores = judge.forward("Sample text", sample_candidates)
 
-            assert call_count == 2
             assert len(scores) == 2
-            assert scores[0][0] == 0.85
+            assert scores[0][0] == 0.5
+            assert scores[0][3] == "ISSUES"
+
+
+class TestFindingsSkipRefinement:
+    """Test that NO_ISSUES findings skip refinement and ISSUES proceeds."""
+
+    def test_no_issues_skips_refinement(self, sample_candidates):
+        """When judge returns NO_ISSUES, refiner should NOT be called."""
+        mock_extractor = MagicMock()
+        mock_extractor.return_value = sample_candidates[0]
+
+        engine = RefinementEngine(PersonTestSchema, mock_extractor)
+
+        # Judge says NO_ISSUES for the best candidate
+        mock_scores = [
+            (0.95, "Perfect extraction", "No improvements needed", "NO_ISSUES"),
+            (0.7, "Partial extraction", "Add missing fields", "ISSUES"),
+        ]
+
+        with patch.object(
+            engine, "_generate_candidates", return_value=sample_candidates
+        ):
+            with patch.object(
+                engine.builtin_judge, "forward", return_value=mock_scores
+            ):
+                with patch.object(engine.refiner, "forward") as mock_refiner:
+                    config = Refine(
+                        strategy=RefinementStrategy.BON_THEN_REFINE,
+                        n_candidates=2,
+                        max_refine_steps=1,
+                    )
+
+                    result, trace = engine.forward("Sample text", config)
+
+                    # Refiner should NOT have been called
+                    mock_refiner.assert_not_called()
+                    # Should return the best candidate directly
+                    assert result == sample_candidates[0]
+                    # No refine diffs should exist
+                    assert len(trace.refine_diffs) == 0
+
+    def test_issues_proceeds_with_refinement(self, sample_candidates):
+        """When judge returns ISSUES, refiner should be called."""
+        mock_extractor = MagicMock()
+        mock_extractor.return_value = sample_candidates[0]
+
+        engine = RefinementEngine(PersonTestSchema, mock_extractor)
+
+        # Judge says ISSUES for the best candidate
+        mock_scores = [
+            (0.9, "Good extraction", "Fix the age field", "ISSUES"),
+            (0.7, "Partial extraction", "Add missing fields", "ISSUES"),
+        ]
+
+        with patch.object(
+            engine, "_generate_candidates", return_value=sample_candidates
+        ):
+            with patch.object(
+                engine.builtin_judge, "forward", return_value=mock_scores
+            ):
+                with patch.object(engine.refiner, "forward") as mock_refiner:
+                    mock_refiner.return_value = sample_candidates[0]
+
+                    config = Refine(
+                        strategy=RefinementStrategy.BON_THEN_REFINE,
+                        n_candidates=2,
+                        max_refine_steps=1,
+                    )
+
+                    result, trace = engine.forward("Sample text", config)
+
+                    # Refiner SHOULD have been called
+                    mock_refiner.assert_called_once()
+
+    def test_findings_stored_in_trace(self, sample_candidates):
+        """Findings should be stored in trace.candidates."""
+        mock_extractor = MagicMock()
+        mock_extractor.return_value = sample_candidates[0]
+
+        engine = RefinementEngine(PersonTestSchema, mock_extractor)
+
+        mock_scores = [
+            (0.95, "Perfect", "No issues", "NO_ISSUES"),
+            (0.7, "Partial", "Fix name", "ISSUES"),
+        ]
+
+        with patch.object(
+            engine, "_generate_candidates", return_value=sample_candidates
+        ):
+            with patch.object(
+                engine.builtin_judge, "forward", return_value=mock_scores
+            ):
+                config = Refine(
+                    strategy=RefinementStrategy.BON,
+                    n_candidates=2,
+                    max_refine_steps=1,
+                )
+
+                result, trace = engine.forward("Sample text", config)
+
+                assert len(trace.candidates) == 2
+                assert trace.candidates[0].findings == "NO_ISSUES"
+                assert trace.candidates[1].findings == "ISSUES"
+
+    def test_single_candidate_defaults_to_issues(self, sample_candidates):
+        """Single candidate path should default findings to ISSUES."""
+        mock_extractor = MagicMock()
+        mock_extractor.return_value = sample_candidates[0]
+
+        engine = RefinementEngine(PersonTestSchema, mock_extractor)
+
+        config = Refine(
+            strategy=RefinementStrategy.REFINE,
+            n_candidates=1,
+            max_refine_steps=1,
+        )
+
+        with patch.object(engine.refiner, "forward", return_value=sample_candidates[0]):
+            result, trace = engine.forward("Sample text", config)
+
+            assert len(trace.candidates) == 1
+            assert trace.candidates[0].findings == "ISSUES"
